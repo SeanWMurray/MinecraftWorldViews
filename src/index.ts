@@ -20,5 +20,20 @@ export {
   SECTOR_SIZE,
   REGION_CHUNKS,
 } from './io/region-file';
+
+// Phase 2: lazy NBT parsing & blockstate unpacking.
+export { NbtReader, Tag, type TagId } from './nbt/reader';
+export { bitsForPalette, unpackPackedInts } from './nbt/bit-packing';
+export {
+  parseChunk,
+  readParsedChunk,
+  blockIndex,
+  isAirState,
+  type BlockState,
+  type ChunkSection,
+  type ParsedChunk,
+} from './nbt/chunk';
+
+// Concurrency.
 export { WorkerPool } from './worker/pool';
-export { createWorkerDecompressor, type WorkerDecompressor } from './worker/region-pool';
+export { createRegionWorkerPool, type RegionWorkerPool } from './worker/region-pool';

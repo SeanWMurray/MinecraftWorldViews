@@ -23,8 +23,9 @@
   <body>
     <h1>MinecraftWorldViews <small>— region inspector</small></h1>
     <p>
-      Open a region file (<code>.mca</code>) from your world's <code>region/</code> folder.
-      Generated chunks light up; click one to stream + decompress its NBT.
+      Open a region file (<code>.mca</code>) from your world's <code>region/</code> folder
+      to render a top-down terrain map (one pixel per block). Click the map to inspect a
+      block column. Supports worlds from Minecraft 1.16 onwards.
     </p>
     <input id="file" type="file" accept=".mca,.mcr" />
     <canvas id="grid" width="512" height="512"></canvas>
@@ -33,17 +34,19 @@
     <!--
       Self-contained so this page runs straight from disk (file://) with no
       install or server. Browsers block ES module imports and Web Workers on
-      file:// URLs, so this inlines the same logic as src/io/ as a classic
+      file:// URLs, so this inlines the same logic as src/ as a classic
       script and decompresses on the main thread (DecompressionStream still
       does its inflate work off-JS). The reusable library lives in src/.
     -->
     <script>
       'use strict';
 
+      // ---------- Phase 1: region I/O & decompression (mirrors src/io/) ----------
+
       const SECTOR_SIZE = 4096;
       const REGION_CHUNKS = 32;
       const HEADER_SIZE = SECTOR_SIZE * 2;
-      const CELL = 512 / REGION_CHUNKS;
+      const MAP_SIZE = REGION_CHUNKS * 16; // 512 blocks per region edge
 
       const chunkIndex = (x, z) => (x & 31) | ((z & 31) << 5);
 
@@ -76,11 +79,11 @@
       }
 
       async function inflate(data, format) {
-        const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream(format));
+        const stream = new Response(data).body.pipeThrough(new DecompressionStream(format));
         return new Uint8Array(await new Response(stream).arrayBuffer());
       }
 
-      async function readChunk(region, x, z) {
+      async function readChunkNbt(region, x, z) {
         const entry = region.locations[chunkIndex(x, z)];
         if (entry === 0) return null;
         const sectorOffset = entry >>> 8;
@@ -100,77 +103,379 @@
         }
         const payload = data.subarray(5, 4 + length);
         const format = compressionFormat(type);
-        const start = performance.now();
-        const nbt = format === null ? payload : await inflate(payload, format);
-        return {
-          type,
-          compressedSize: payload.byteLength,
-          nbt,
-          ms: performance.now() - start,
-          timestamp: region.timestamps[chunkIndex(x, z)],
-        };
+        return format === null ? payload : await inflate(payload, format);
       }
 
-      // --- UI ---
+      // ---------- Phase 2: lazy NBT chunk parser (mirrors src/nbt/) ----------
+
+      const TAG_END = 0, TAG_BYTE = 1, TAG_SHORT = 2, TAG_INT = 3, TAG_LONG = 4,
+        TAG_FLOAT = 5, TAG_DOUBLE = 6, TAG_BYTE_ARRAY = 7, TAG_STRING = 8,
+        TAG_LIST = 9, TAG_COMPOUND = 10, TAG_INT_ARRAY = 11, TAG_LONG_ARRAY = 12;
+
+      function nbtReader(data) {
+        return { data, view: new DataView(data.buffer, data.byteOffset, data.byteLength), pos: 0 };
+      }
+      const u8 = (r) => r.data[r.pos++];
+      const i8 = (r) => r.view.getInt8(r.pos++);
+      const u16 = (r) => { const v = r.view.getUint16(r.pos); r.pos += 2; return v; };
+      const i32 = (r) => { const v = r.view.getInt32(r.pos); r.pos += 4; return v; };
+      function readStr(r) {
+        const n = u16(r);
+        let s = '';
+        for (let i = 0; i < n; i++) s += String.fromCharCode(r.data[r.pos + i]);
+        r.pos += n;
+        return s;
+      }
+      const skipStr = (r) => { r.pos += 2 + r.view.getUint16(r.pos); };
+
+      function skipValue(r, type) {
+        switch (type) {
+          case TAG_BYTE: r.pos += 1; return;
+          case TAG_SHORT: r.pos += 2; return;
+          case TAG_INT: case TAG_FLOAT: r.pos += 4; return;
+          case TAG_LONG: case TAG_DOUBLE: r.pos += 8; return;
+          case TAG_BYTE_ARRAY: r.pos += 4 + r.view.getInt32(r.pos); return;
+          case TAG_STRING: skipStr(r); return;
+          case TAG_LIST: {
+            const itemType = u8(r), count = i32(r);
+            if (count <= 0) return;
+            switch (itemType) {
+              case TAG_BYTE: r.pos += count; return;
+              case TAG_SHORT: r.pos += count * 2; return;
+              case TAG_INT: case TAG_FLOAT: r.pos += count * 4; return;
+              case TAG_LONG: case TAG_DOUBLE: r.pos += count * 8; return;
+              default: for (let i = 0; i < count; i++) skipValue(r, itemType); return;
+            }
+          }
+          case TAG_COMPOUND:
+            for (;;) {
+              const id = u8(r);
+              if (id === TAG_END) return;
+              skipStr(r);
+              skipValue(r, id);
+            }
+          case TAG_INT_ARRAY: r.pos += 4 + r.view.getInt32(r.pos) * 4; return;
+          case TAG_LONG_ARRAY: r.pos += 4 + r.view.getInt32(r.pos) * 8; return;
+          default: throw new Error(`invalid NBT tag ${type} at byte ${r.pos}`);
+        }
+      }
+
+      const bitsForPalette = (size) => Math.max(4, 32 - Math.clz32(size - 1));
+
+      function unpackPackedInts(view, byteOffset, longCount, bits, out) {
+        const entriesPerLong = (64 / bits) | 0;
+        const mask = (1 << bits) - 1;
+        let i = 0;
+        for (let l = 0; l < longCount && i < out.length; l++) {
+          const hi = view.getUint32(byteOffset + l * 8);
+          const lo = view.getUint32(byteOffset + l * 8 + 4);
+          for (let e = 0; e < entriesPerLong && i < out.length; e++) {
+            const bit = e * bits;
+            out[i++] =
+              bit + bits <= 32 ? (lo >>> bit) & mask :
+              bit >= 32 ? (hi >>> (bit - 32)) & mask :
+              ((lo >>> bit) | (hi << (32 - bit))) & mask;
+          }
+        }
+      }
+
+      function readPalette(r) {
+        const itemType = u8(r), count = i32(r);
+        const palette = [];
+        if (itemType !== TAG_COMPOUND) {
+          for (let i = 0; i < count; i++) skipValue(r, itemType);
+          return palette;
+        }
+        for (let i = 0; i < count; i++) {
+          let name = '';
+          for (;;) {
+            const id = u8(r);
+            if (id === TAG_END) break;
+            const key = readStr(r);
+            if (id === TAG_STRING && key === 'Name') name = readStr(r);
+            else skipValue(r, id);
+          }
+          palette.push(name);
+        }
+        return palette;
+      }
+
+      function readSection(r) {
+        let y = 0, palette = null, dataOffset = -1, dataLongs = 0;
+        for (;;) {
+          const id = u8(r);
+          if (id === TAG_END) break;
+          const name = readStr(r);
+          if (id === TAG_BYTE && name === 'Y') y = i8(r);
+          else if (id === TAG_COMPOUND && name === 'block_states') {
+            for (;;) {
+              const innerId = u8(r);
+              if (innerId === TAG_END) break;
+              const innerName = readStr(r);
+              if (innerId === TAG_LIST && innerName === 'palette') palette = readPalette(r);
+              else if (innerId === TAG_LONG_ARRAY && innerName === 'data') {
+                dataLongs = i32(r); dataOffset = r.pos; r.pos += dataLongs * 8;
+              } else skipValue(r, innerId);
+            }
+          } else if (id === TAG_LIST && name === 'Palette') palette = readPalette(r);
+          else if (id === TAG_LONG_ARRAY && name === 'BlockStates') {
+            dataLongs = i32(r); dataOffset = r.pos; r.pos += dataLongs * 8;
+          } else skipValue(r, id);
+        }
+        if (palette === null || palette.length === 0) return null;
+        let blocks = null;
+        if (palette.length > 1 && dataOffset >= 0) {
+          blocks = new Uint16Array(4096);
+          unpackPackedInts(r.view, dataOffset, dataLongs, bitsForPalette(palette.length), blocks);
+        }
+        return { y, palette, blocks };
+      }
+
+      function readChunkCompound(r, chunk, allowLevel) {
+        for (;;) {
+          const id = u8(r);
+          if (id === TAG_END) return;
+          const name = readStr(r);
+          if (id === TAG_LIST && (name === 'sections' || name === 'Sections')) {
+            const itemType = u8(r), count = i32(r);
+            if (itemType === TAG_COMPOUND) {
+              for (let i = 0; i < count; i++) {
+                const section = readSection(r);
+                if (section !== null) chunk.sections.push(section);
+              }
+            } else {
+              for (let i = 0; i < count; i++) skipValue(r, itemType);
+            }
+          } else if (id === TAG_COMPOUND && name === 'Level' && allowLevel) {
+            readChunkCompound(r, chunk, false);
+          } else skipValue(r, id);
+        }
+      }
+
+      function parseChunk(nbt) {
+        const r = nbtReader(nbt);
+        if (u8(r) !== TAG_COMPOUND) throw new Error('chunk NBT must start with a compound tag');
+        skipStr(r);
+        const chunk = { sections: [] };
+        readChunkCompound(r, chunk, true);
+        chunk.sections.sort((a, b) => b.y - a.y); // top-down for surface scans
+        return chunk;
+      }
+
+      // ---------- Terrain map rendering ----------
+
+      const AIR = new Set(['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air']);
+
+      const BLOCK_COLORS = {
+        grass_block: [124, 189, 107], dirt: [134, 96, 67], coarse_dirt: [119, 85, 59],
+        rooted_dirt: [124, 90, 64], mud: [60, 57, 60], podzol: [90, 63, 35],
+        mycelium: [111, 99, 105], stone: [125, 125, 125], deepslate: [80, 80, 86],
+        granite: [149, 103, 86], diorite: [188, 188, 188], andesite: [136, 136, 137],
+        tuff: [108, 110, 103], calcite: [223, 224, 220], bedrock: [60, 60, 60],
+        water: [63, 118, 228], lava: [207, 92, 20], ice: [145, 183, 253],
+        packed_ice: [125, 173, 255], blue_ice: [116, 167, 253], snow: [240, 240, 240],
+        snow_block: [240, 240, 240], powder_snow: [235, 240, 245],
+        sand: [219, 211, 160], red_sand: [190, 102, 33], gravel: [136, 126, 126],
+        sandstone: [216, 202, 157], red_sandstone: [186, 99, 29], clay: [160, 166, 179],
+        oak_leaves: [60, 130, 60], birch_leaves: [107, 141, 70], spruce_leaves: [45, 90, 45],
+        jungle_leaves: [55, 135, 45], acacia_leaves: [90, 140, 50], dark_oak_leaves: [40, 95, 35],
+        mangrove_leaves: [55, 120, 50], azalea_leaves: [80, 135, 60], cherry_leaves: [228, 160, 172],
+        oak_log: [109, 85, 50], spruce_log: [58, 37, 16], birch_log: [193, 179, 135],
+        grass: [110, 170, 90], short_grass: [110, 170, 90], tall_grass: [110, 170, 90],
+        fern: [100, 160, 80], large_fern: [100, 160, 80], seagrass: [50, 125, 90],
+        tall_seagrass: [50, 125, 90], kelp: [40, 110, 75], kelp_plant: [40, 110, 75],
+        netherrack: [97, 38, 38], soul_sand: [81, 62, 50], soul_soil: [75, 57, 46],
+        basalt: [73, 72, 77], blackstone: [42, 36, 41], end_stone: [221, 223, 165],
+        moss_block: [89, 109, 45], moss_carpet: [89, 109, 45], mushroom_stem: [203, 196, 185],
+        terracotta: [152, 94, 67], obsidian: [21, 18, 30], cobblestone: [110, 110, 110],
+        mossy_cobblestone: [90, 108, 90], farmland: [114, 76, 48], dirt_path: [148, 121, 65],
+      };
+
+      const PACKED_COLORS = new Map();
+
+      /** Colour for a block id, packed as 0xAARRGGBB and memoised per name. */
+      function colorFor(name) {
+        let packed = PACKED_COLORS.get(name);
+        if (packed !== undefined) return packed;
+        const short = name.startsWith('minecraft:') ? name.slice(10) : name;
+        let c = BLOCK_COLORS[short];
+        if (!c) {
+          // Stable fallback colour for anything not in the table (FNV-1a hash).
+          let h = 2166136261;
+          for (let i = 0; i < short.length; i++) {
+            h ^= short.charCodeAt(i);
+            h = Math.imul(h, 16777619);
+          }
+          c = [70 + ((h >>> 0) % 150), 70 + ((h >>> 8) % 150), 70 + ((h >>> 16) % 150)];
+        }
+        packed = (0xff000000 | (c[0] << 16) | (c[1] << 8) | c[2]) >>> 0;
+        PACKED_COLORS.set(name, packed);
+        return packed;
+      }
+
+      const NO_BLOCK = -32768;
+
+      // ---------- UI ----------
 
       const input = document.getElementById('file');
       const canvas = document.getElementById('grid');
       const status = document.getElementById('status');
       const ctx = canvas.getContext('2d');
-      let region = null;
 
-      function drawRegion() {
-        ctx.fillStyle = '#1b1b22';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#3fae6a';
-        for (let i = 0; i < 1024; i++) {
-          if (region.locations[i] !== 0) {
-            ctx.fillRect((i & 31) * CELL + 1, (i >>> 5) * CELL + 1, CELL - 2, CELL - 2);
+      let region = null;
+      let renderToken = 0;
+      const heights = new Int16Array(MAP_SIZE * MAP_SIZE);
+      const topBlocks = new Array(MAP_SIZE * MAP_SIZE);
+      const surface = new Uint32Array(MAP_SIZE * MAP_SIZE); // packed colours, 0 = empty
+
+      /** Finds each column's surface block and records its height/name/colour. */
+      function computeChunk(cx, cz, parsed) {
+        const sections = parsed.sections; // already sorted top-down
+        for (const s of sections) {
+          s.air = s.palette.map((name) => AIR.has(name));
+          s.col = s.palette.map(colorFor);
+        }
+        for (let z = 0; z < 16; z++) {
+          for (let x = 0; x < 16; x++) {
+            let topY = NO_BLOCK, color = 0, name = null;
+            for (const s of sections) {
+              if (s.blocks === null) {
+                if (s.air[0]) continue;
+                topY = s.y * 16 + 15; color = s.col[0]; name = s.palette[0];
+                break;
+              }
+              for (let sy = 15; sy >= 0; sy--) {
+                const pi = s.blocks[(((sy << 4) | z) << 4) | x];
+                if (!s.air[pi]) {
+                  topY = s.y * 16 + sy; color = s.col[pi]; name = s.palette[pi];
+                  break;
+                }
+              }
+              if (topY !== NO_BLOCK) break;
+            }
+            const gi = (cz * 16 + z) * MAP_SIZE + cx * 16 + x;
+            heights[gi] = topY;
+            topBlocks[gi] = name;
+            surface[gi] = color;
           }
         }
       }
 
-      const hex = (bytes) =>
-        Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(' ');
+      /** Quick unshaded preview of one chunk while the rest are still loading. */
+      function paintChunkPreview(cx, cz) {
+        const img = ctx.createImageData(16, 16);
+        const pixels = img.data;
+        for (let z = 0; z < 16; z++) {
+          for (let x = 0; x < 16; x++) {
+            const c = surface[(cz * 16 + z) * MAP_SIZE + cx * 16 + x];
+            const px = (z * 16 + x) * 4;
+            pixels[px] = c === 0 ? 21 : (c >>> 16) & 255;
+            pixels[px + 1] = c === 0 ? 21 : (c >>> 8) & 255;
+            pixels[px + 2] = c === 0 ? 26 : c & 255;
+            pixels[px + 3] = 255;
+          }
+        }
+        ctx.putImageData(img, cx * 16, cz * 16);
+      }
+
+      /** Final pass: hillshade the whole map against northern neighbours in one putImageData. */
+      function paintShaded() {
+        const img = ctx.createImageData(MAP_SIZE, MAP_SIZE);
+        const pixels = img.data;
+        for (let gi = 0, px = 0; gi < surface.length; gi++, px += 4) {
+          const c = surface[gi];
+          if (c === 0) {
+            pixels[px] = 21; pixels[px + 1] = 21; pixels[px + 2] = 26; pixels[px + 3] = 255;
+            continue;
+          }
+          const h = heights[gi];
+          const north = gi >= MAP_SIZE ? heights[gi - MAP_SIZE] : NO_BLOCK;
+          const f = north === NO_BLOCK || north === h ? 1 : h > north ? 1.14 : 0.82;
+          pixels[px] = Math.min(255, ((c >>> 16) & 255) * f);
+          pixels[px + 1] = Math.min(255, ((c >>> 8) & 255) * f);
+          pixels[px + 2] = Math.min(255, (c & 255) * f);
+          pixels[px + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+      }
+
+      async function renderMap(currentRegion, fileName) {
+        const token = ++renderToken;
+        heights.fill(NO_BLOCK);
+        topBlocks.fill(null);
+        surface.fill(0);
+        ctx.fillStyle = '#15151a';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const coords = [];
+        for (let i = 0; i < 1024; i++) {
+          if (currentRegion.locations[i] !== 0) coords.push(i);
+        }
+        const total = coords.length;
+        let next = 0, done = 0, failed = 0;
+        const t0 = performance.now();
+
+        // Pipeline: keep many chunks in flight so file reads and native
+        // decompression overlap instead of running strictly one at a time.
+        const CONCURRENCY = Math.min(32, Math.max(8, (navigator.hardwareConcurrency || 8) * 2));
+        const lanes = Array.from({ length: Math.min(CONCURRENCY, total) }, async () => {
+          while (next < coords.length && token === renderToken) {
+            const c = coords[next++];
+            const cx = c & 31, cz = c >>> 5;
+            try {
+              const nbt = await readChunkNbt(currentRegion, cx, cz);
+              if (token !== renderToken) return;
+              computeChunk(cx, cz, parseChunk(nbt));
+              paintChunkPreview(cx, cz);
+            } catch (err) {
+              failed++;
+            }
+            done++;
+          }
+        });
+
+        const progress = setInterval(() => {
+          status.textContent = `Rendering terrain… ${done}/${total} chunks`;
+        }, 100);
+        try {
+          await Promise.all(lanes);
+        } finally {
+          clearInterval(progress);
+        }
+        if (token !== renderToken) return;
+
+        paintShaded();
+        const secs = ((performance.now() - t0) / 1000).toFixed(2);
+        status.textContent =
+          `${fileName}: ${total} chunks rendered in ${secs} s` +
+          (failed > 0 ? ` (${failed} unreadable)` : '') +
+          `. Click the map to inspect a block column.`;
+      }
 
       input.addEventListener('change', async () => {
         const file = input.files && input.files[0];
         if (!file) return;
         try {
           region = await openRegion(file);
-          drawRegion();
-          let count = 0;
-          for (let i = 0; i < 1024; i++) if (region.locations[i] !== 0) count++;
-          status.textContent = `${file.name}: ${count}/1024 chunks present. Click a chunk to decompress it.`;
+          await renderMap(region, file.name);
         } catch (err) {
           region = null;
           status.textContent = `Failed to open ${file.name}: ${err.message || err}`;
         }
       });
 
-      canvas.addEventListener('click', async (ev) => {
+      canvas.addEventListener('click', (ev) => {
         if (!region) return;
         const rect = canvas.getBoundingClientRect();
-        const x = Math.floor(((ev.clientX - rect.left) / rect.width) * REGION_CHUNKS);
-        const z = Math.floor(((ev.clientY - rect.top) / rect.height) * REGION_CHUNKS);
-        try {
-          const chunk = await readChunk(region, x, z);
-          if (chunk === null) {
-            status.textContent = `Chunk (${x}, ${z}): not generated.`;
-            return;
-          }
-          drawRegion();
-          ctx.fillStyle = '#e8c47a';
-          ctx.fillRect(x * CELL + 1, z * CELL + 1, CELL - 2, CELL - 2);
-          status.textContent =
-            `Chunk (${x}, ${z})\n` +
-            `  compressed:   ${chunk.compressedSize.toLocaleString()} B (type ${chunk.type})\n` +
-            `  decompressed: ${chunk.nbt.byteLength.toLocaleString()} B in ${chunk.ms.toFixed(2)} ms\n` +
-            `  modified:     ${new Date(chunk.timestamp * 1000).toISOString()}\n` +
-            `  NBT head:     ${hex(chunk.nbt.subarray(0, 16))}`;
-        } catch (err) {
-          status.textContent = `Chunk (${x}, ${z}) failed: ${err.message || err}`;
-        }
+        const gx = Math.floor(((ev.clientX - rect.left) / rect.width) * MAP_SIZE);
+        const gz = Math.floor(((ev.clientY - rect.top) / rect.height) * MAP_SIZE);
+        const gi = gz * MAP_SIZE + gx;
+        const name = topBlocks[gi];
+        const cx = gx >> 4, cz = gz >> 4;
+        status.textContent =
+          name == null
+            ? `Column (${gx}, ${gz}) in chunk (${cx}, ${cz}): no blocks.`
+            : `Column (${gx}, ${gz}) in chunk (${cx}, ${cz}): ${name} at y=${heights[gi]}`;
       });
     </script>
   </body>

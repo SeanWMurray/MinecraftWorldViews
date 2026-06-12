@@ -10,10 +10,10 @@ draw calls.
 
 | Phase | Scope | Status |
 | ----- | ----- | ------ |
-| 1. I/O & decompression | Stream `.mca` region files, ranged reads, native `DecompressionStream`, worker pool | ✅ Implemented |
-| 2. NBT & blockstates | Lazy NBT parser, bit-packed palette extraction | ⬜ Next |
-| 3. Geometry & meshing | Greedy meshing + culling (Wasm) | ⬜ Planned |
-| 4. WebGL rendering | Texture atlas, frustum culling, direct buffer upload | ⬜ Planned |
+| 1. I/O & decompression | Stream `.mca` region files, ranged reads, native `DecompressionStream`, worker pool | ya |
+| 2. NBT & blockstates | Lazy NBT parser, bit-packed palette extraction | kinda |
+| 3. Geometry & meshing | Greedy meshing + culling (Wasm) | not yet |
+| 4. WebGL rendering | Texture atlas, frustum culling, direct buffer upload | not yet|
 
 ## Architecture
 
@@ -29,39 +29,62 @@ src/
     region-file.ts         Anvil (.mca) parser — header tables in Uint32Arrays,
                            chunks fetched lazily one ranged read at a time
     compression.ts         Native DecompressionStream (gzip/zlib) wrapper
+  nbt/
+    reader.ts              Forward-only NBT cursor; skips unwanted branches
+                           with pointer arithmetic, zero allocation
+    chunk.ts               Lazy chunk parser — reads only sections/palettes/
+                           blockstates, ignores entities, lighting, ticks
+    bit-packing.ts         1.16+ packed-index unpacking via 32-bit halves
   worker/
     pool.ts                Generic Web Worker pool (transfer-based, FIFO queue)
-    region-worker.ts       Off-thread chunk decompression
-    region-pool.ts         Pool-backed ChunkDecompressor factory
-test/                      Vitest suite with synthetic in-memory region files
+    region-worker.ts       Off-thread chunk decompression + parsing
+    region-pool.ts         Pool-backed decompress/parse pipeline factory
+test/                      Vitest suite with synthetic region files & NBT
 ```
 
-### Efficiency notes (Phase 1)
+### Efficiency notes
 
 - **No full-file loads.** `RegionFile.open()` reads only the 8 KiB header; each chunk costs
   exactly one ranged read of its sectors. Works the same over `Blob.slice` and HTTP `Range`.
 - **Flat data.** Location/timestamp tables live in two `Uint32Array`s; chunk payloads are
   zero-copy `subarray` views into the sector read.
-- **Off-thread inflate.** `createWorkerDecompressor()` moves payloads into workers via
-  transfer lists (never structured-clone copies) and transfers result buffers back.
+- **Lazy NBT.** The parser never builds a tag tree. Unwanted branches (entities, heightmaps,
+  lighting, tick queues) are skipped with pure pointer arithmetic; packed blockstates are
+  unpacked straight out of the NBT buffer into one `Uint16Array` per section.
+- **No BigInt on the hot path.** Packed 64-bit longs are processed as pairs of 32-bit halves
+  with plain integer ops (entries never span longs in the 1.16+ format).
+- **Off-thread everything.** `createRegionWorkerPool()` decompresses *and* parses in workers;
+  payloads move via transfer lists (never structured-clone copies) and section arrays are
+  transferred back.
 
 ## Usage
 
 ```ts
-import { BlobSource, RegionFile, createWorkerDecompressor } from 'minecraft-world-views';
+import { BlobSource, RegionFile, createRegionWorkerPool, isAirState, blockIndex } from 'minecraft-world-views';
 
-const { decompress } = createWorkerDecompressor(); // worker pool, optional
-const region = await RegionFile.open(new BlobSource(file), { decompress });
+const pool = createRegionWorkerPool();
+const region = await RegionFile.open(new BlobSource(file), { decompress: pool.decompress });
 
 for (const { x, z } of region.chunks()) {
-  const nbt = await region.readChunk(x, z); // raw NBT bytes (Phase 2 parses these)
+  const raw = await region.readRawChunk(x, z);
+  const chunk = await pool.parse(raw.compressionType, raw.payload); // off-thread
+  for (const section of chunk.sections) {
+    // section.palette: BlockState[]; section.blocks: Uint16Array of palette
+    // indices in YZX order (null = whole section is palette[0])
+    const state = section.palette[section.blocks?.[blockIndex(0, 0, 0)] ?? 0];
+  }
 }
 ```
+
+Supports worlds from Minecraft 1.16 onwards (1.18+ `sections` layout and the older
+`Level.Sections` layout).
 
 ## Running it
 
 Download or clone the repo and open `index.html` in a browser. That's it — no install,
-no build, no server. Pick an `.mca` file and click chunks to inspect them.
+no build, no server. Pick an `.mca` file and it renders a top-down terrain map of the
+region, one pixel per block, with map-style hillshading; click anywhere to identify the
+surface block and its height.
 
 (`index.html` inlines the Phase 1 pipeline as a classic script because browsers block
 ES module imports and Web Workers on pages opened from disk. The importable library
