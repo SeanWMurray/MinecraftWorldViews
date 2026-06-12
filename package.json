@@ -1,0 +1,28 @@
+{
+  "name": "minecraft-world-views",
+  "version": "0.1.0",
+  "description": "High-efficiency, browser-native voxel rendering engine for Minecraft worlds",
+  "type": "module",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SeanWMurray/MinecraftWorldViews.git"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^3.0.5"
+  }
+}
