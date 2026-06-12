@@ -83,7 +83,8 @@ Supports worlds from Minecraft 1.16 onwards (1.18+ `sections` layout and the old
 
 Download or clone the repo and open `index.html` in a browser. That's it — no install,
 no build, no server. Pick an `.mca` file and it renders a top-down terrain map of the
-region, one pixel per block, with map-style hillshading; click anywhere to identify the
+region, one pixel per block, with map-style hillshading. Scroll to zoom (anchored at the
+cursor), drag to pan, double-click to reset the view, and click anywhere to identify the
 surface block and its height.
 
 (`index.html` inlines the Phase 1 pipeline as a classic script because browsers block

@@ -24,8 +24,9 @@
     <h1>MinecraftWorldViews <small>— region inspector</small></h1>
     <p>
       Open a region file (<code>.mca</code>) from your world's <code>region/</code> folder
-      to render a top-down terrain map (one pixel per block). Click the map to inspect a
-      block column. Supports worlds from Minecraft 1.16 onwards.
+      to render a top-down terrain map (one pixel per block). Scroll to zoom, drag to pan,
+      double-click to reset, click to inspect a block column. Supports worlds from
+      Minecraft 1.16 onwards.
     </p>
     <input id="file" type="file" accept=".mca,.mcr" />
     <canvas id="grid" width="512" height="512"></canvas>
@@ -322,6 +323,42 @@
       const status = document.getElementById('status');
       const ctx = canvas.getContext('2d');
 
+      // The terrain is rendered once into an offscreen map canvas; the visible
+      // canvas blits a sub-rectangle of it, so zoom/pan never re-reads chunks.
+      const map = document.createElement('canvas');
+      map.width = MAP_SIZE;
+      map.height = MAP_SIZE;
+      const mapCtx = map.getContext('2d');
+
+      // Viewport over the map: top-left corner (map px) + magnification.
+      let viewScale = 1, viewX = 0, viewY = 0;
+      let drawQueued = false;
+
+      function clampView() {
+        const span = MAP_SIZE / viewScale;
+        viewX = Math.min(Math.max(viewX, 0), MAP_SIZE - span);
+        viewY = Math.min(Math.max(viewY, 0), MAP_SIZE - span);
+      }
+
+      function draw() {
+        const span = MAP_SIZE / viewScale;
+        ctx.imageSmoothingEnabled = false; // crisp pixels when zoomed in
+        ctx.drawImage(map, viewX, viewY, span, span, 0, 0, canvas.width, canvas.height);
+      }
+
+      function scheduleDraw() {
+        if (drawQueued) return;
+        drawQueued = true;
+        requestAnimationFrame(() => {
+          drawQueued = false;
+          draw();
+        });
+      }
+
+      mapCtx.fillStyle = '#15151a';
+      mapCtx.fillRect(0, 0, MAP_SIZE, MAP_SIZE);
+      draw();
+
       let region = null;
       let renderToken = 0;
       const heights = new Int16Array(MAP_SIZE * MAP_SIZE);
@@ -363,7 +400,7 @@
 
       /** Quick unshaded preview of one chunk while the rest are still loading. */
       function paintChunkPreview(cx, cz) {
-        const img = ctx.createImageData(16, 16);
+        const img = mapCtx.createImageData(16, 16);
         const pixels = img.data;
         for (let z = 0; z < 16; z++) {
           for (let x = 0; x < 16; x++) {
@@ -375,12 +412,13 @@
             pixels[px + 3] = 255;
           }
         }
-        ctx.putImageData(img, cx * 16, cz * 16);
+        mapCtx.putImageData(img, cx * 16, cz * 16);
+        scheduleDraw();
       }
 
       /** Final pass: hillshade the whole map against northern neighbours in one putImageData. */
       function paintShaded() {
-        const img = ctx.createImageData(MAP_SIZE, MAP_SIZE);
+        const img = mapCtx.createImageData(MAP_SIZE, MAP_SIZE);
         const pixels = img.data;
         for (let gi = 0, px = 0; gi < surface.length; gi++, px += 4) {
           const c = surface[gi];
@@ -396,7 +434,8 @@
           pixels[px + 2] = Math.min(255, (c & 255) * f);
           pixels[px + 3] = 255;
         }
-        ctx.putImageData(img, 0, 0);
+        mapCtx.putImageData(img, 0, 0);
+        scheduleDraw();
       }
 
       async function renderMap(currentRegion, fileName) {
@@ -404,8 +443,12 @@
         heights.fill(NO_BLOCK);
         topBlocks.fill(null);
         surface.fill(0);
-        ctx.fillStyle = '#15151a';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        viewScale = 1;
+        viewX = 0;
+        viewY = 0;
+        mapCtx.fillStyle = '#15151a';
+        mapCtx.fillRect(0, 0, MAP_SIZE, MAP_SIZE);
+        scheduleDraw();
 
         const coords = [];
         for (let i = 0; i < 1024; i++) {
@@ -464,18 +507,82 @@
         }
       });
 
-      canvas.addEventListener('click', (ev) => {
-        if (!region) return;
+      /** Map coordinates of a mouse event, through the current zoom/pan. */
+      function mapCoords(ev) {
         const rect = canvas.getBoundingClientRect();
-        const gx = Math.floor(((ev.clientX - rect.left) / rect.width) * MAP_SIZE);
-        const gz = Math.floor(((ev.clientY - rect.top) / rect.height) * MAP_SIZE);
+        const span = MAP_SIZE / viewScale;
+        return {
+          gx: Math.min(MAP_SIZE - 1, Math.floor(viewX + ((ev.clientX - rect.left) / rect.width) * span)),
+          gz: Math.min(MAP_SIZE - 1, Math.floor(viewY + ((ev.clientY - rect.top) / rect.height) * span)),
+        };
+      }
+
+      canvas.addEventListener('click', (ev) => {
+        if (!region || dragMoved) return;
+        const { gx, gz } = mapCoords(ev);
         const gi = gz * MAP_SIZE + gx;
         const name = topBlocks[gi];
         const cx = gx >> 4, cz = gz >> 4;
+        const zoom = viewScale > 1 ? ` [${viewScale.toFixed(1)}x]` : '';
         status.textContent =
           name == null
-            ? `Column (${gx}, ${gz}) in chunk (${cx}, ${cz}): no blocks.`
-            : `Column (${gx}, ${gz}) in chunk (${cx}, ${cz}): ${name} at y=${heights[gi]}`;
+            ? `Column (${gx}, ${gz}) in chunk (${cx}, ${cz}): no blocks.${zoom}`
+            : `Column (${gx}, ${gz}) in chunk (${cx}, ${cz}): ${name} at y=${heights[gi]}${zoom}`;
+      });
+
+      // Wheel: zoom anchored at the cursor (the block under the pointer stays put).
+      canvas.addEventListener('wheel', (ev) => {
+        if (!region) return;
+        ev.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+        const fx = (ev.clientX - rect.left) / rect.width;
+        const fy = (ev.clientY - rect.top) / rect.height;
+        const oldSpan = MAP_SIZE / viewScale;
+        viewScale = Math.min(32, Math.max(1, viewScale * Math.pow(2, -ev.deltaY / 240)));
+        const newSpan = MAP_SIZE / viewScale;
+        viewX += fx * (oldSpan - newSpan);
+        viewY += fy * (oldSpan - newSpan);
+        clampView();
+        scheduleDraw();
+      }, { passive: false });
+
+      // Drag to pan. A press that barely moves still counts as a click.
+      let panning = false, dragMoved = false, lastX = 0, lastY = 0;
+      canvas.addEventListener('pointerdown', (ev) => {
+        if (!region) return;
+        panning = true;
+        dragMoved = false;
+        lastX = ev.clientX;
+        lastY = ev.clientY;
+        canvas.setPointerCapture(ev.pointerId);
+      });
+      canvas.addEventListener('pointermove', (ev) => {
+        if (!panning) return;
+        const dx = ev.clientX - lastX;
+        const dy = ev.clientY - lastY;
+        if (!dragMoved && Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+        dragMoved = true;
+        canvas.style.cursor = 'grabbing';
+        lastX = ev.clientX;
+        lastY = ev.clientY;
+        const rect = canvas.getBoundingClientRect();
+        const span = MAP_SIZE / viewScale;
+        viewX -= (dx / rect.width) * span;
+        viewY -= (dy / rect.height) * span;
+        clampView();
+        scheduleDraw();
+      });
+      canvas.addEventListener('pointerup', () => {
+        panning = false;
+        canvas.style.cursor = 'crosshair';
+      });
+
+      // Double-click: reset to the full region.
+      canvas.addEventListener('dblclick', () => {
+        viewScale = 1;
+        viewX = 0;
+        viewY = 0;
+        scheduleDraw();
       });
     </script>
   </body>
