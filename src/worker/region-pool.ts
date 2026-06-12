@@ -18,7 +18,7 @@ export interface WorkerDecompressor {
  */
 export function createWorkerDecompressor(poolSize?: number): WorkerDecompressor {
   const pool = new WorkerPool(
-    () => new Worker(new URL('./region-worker.ts', import.meta.url), { type: 'module' }),
+    () => new Worker(new URL('./region-worker.js', import.meta.url), { type: 'module' }),
     poolSize,
   );
   return {

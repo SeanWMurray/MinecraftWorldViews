@@ -21,14 +21,157 @@
     </style>
   </head>
   <body>
-    <h1>MinecraftWorldViews <small>— Phase 1 region inspector</small></h1>
+    <h1>MinecraftWorldViews <small>— region inspector</small></h1>
     <p>
       Open a region file (<code>.mca</code>) from your world's <code>region/</code> folder.
-      Generated chunks light up; click one to stream + decompress its NBT in a worker.
+      Generated chunks light up; click one to stream + decompress its NBT.
     </p>
     <input id="file" type="file" accept=".mca,.mcr" />
     <canvas id="grid" width="512" height="512"></canvas>
     <pre id="status">No region loaded.</pre>
-    <script type="module" src="/demo/main.ts"></script>
+
+    <!--
+      Self-contained so this page runs straight from disk (file://) with no
+      install or server. Browsers block ES module imports and Web Workers on
+      file:// URLs, so this inlines the same logic as src/io/ as a classic
+      script and decompresses on the main thread (DecompressionStream still
+      does its inflate work off-JS). The reusable library lives in src/.
+    -->
+    <script>
+      'use strict';
+
+      const SECTOR_SIZE = 4096;
+      const REGION_CHUNKS = 32;
+      const HEADER_SIZE = SECTOR_SIZE * 2;
+      const CELL = 512 / REGION_CHUNKS;
+
+      const chunkIndex = (x, z) => (x & 31) | ((z & 31) << 5);
+
+      async function readRange(file, offset, length) {
+        return new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+      }
+
+      async function openRegion(file) {
+        const header = await readRange(file, 0, HEADER_SIZE);
+        if (header.byteLength < HEADER_SIZE) {
+          throw new Error(`region file too small: ${header.byteLength} bytes`);
+        }
+        const view = new DataView(header.buffer);
+        const locations = new Uint32Array(1024);
+        const timestamps = new Uint32Array(1024);
+        for (let i = 0; i < 1024; i++) {
+          locations[i] = view.getUint32(i * 4);
+          timestamps[i] = view.getUint32(SECTOR_SIZE + i * 4);
+        }
+        return { file, locations, timestamps };
+      }
+
+      function compressionFormat(type) {
+        switch (type) {
+          case 1: return 'gzip';
+          case 2: return 'deflate';
+          case 3: return null;
+          default: throw new Error(`unsupported chunk compression type ${type}`);
+        }
+      }
+
+      async function inflate(data, format) {
+        const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream(format));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+
+      async function readChunk(region, x, z) {
+        const entry = region.locations[chunkIndex(x, z)];
+        if (entry === 0) return null;
+        const sectorOffset = entry >>> 8;
+        const sectorCount = entry & 0xff;
+        if (sectorOffset < 2 || sectorCount === 0) {
+          throw new Error(`corrupt location entry for chunk (${x}, ${z})`);
+        }
+        const data = await readRange(region.file, sectorOffset * SECTOR_SIZE, sectorCount * SECTOR_SIZE);
+        if (data.byteLength < 5) throw new Error(`truncated chunk record at (${x}, ${z})`);
+        const length = new DataView(data.buffer).getUint32(0);
+        if (length < 1 || 4 + length > data.byteLength) {
+          throw new Error(`corrupt chunk record at (${x}, ${z})`);
+        }
+        const type = data[4];
+        if ((type & 0x80) !== 0) {
+          throw new Error(`chunk (${x}, ${z}) is stored externally (.mcc); not supported yet`);
+        }
+        const payload = data.subarray(5, 4 + length);
+        const format = compressionFormat(type);
+        const start = performance.now();
+        const nbt = format === null ? payload : await inflate(payload, format);
+        return {
+          type,
+          compressedSize: payload.byteLength,
+          nbt,
+          ms: performance.now() - start,
+          timestamp: region.timestamps[chunkIndex(x, z)],
+        };
+      }
+
+      // --- UI ---
+
+      const input = document.getElementById('file');
+      const canvas = document.getElementById('grid');
+      const status = document.getElementById('status');
+      const ctx = canvas.getContext('2d');
+      let region = null;
+
+      function drawRegion() {
+        ctx.fillStyle = '#1b1b22';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#3fae6a';
+        for (let i = 0; i < 1024; i++) {
+          if (region.locations[i] !== 0) {
+            ctx.fillRect((i & 31) * CELL + 1, (i >>> 5) * CELL + 1, CELL - 2, CELL - 2);
+          }
+        }
+      }
+
+      const hex = (bytes) =>
+        Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(' ');
+
+      input.addEventListener('change', async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        try {
+          region = await openRegion(file);
+          drawRegion();
+          let count = 0;
+          for (let i = 0; i < 1024; i++) if (region.locations[i] !== 0) count++;
+          status.textContent = `${file.name}: ${count}/1024 chunks present. Click a chunk to decompress it.`;
+        } catch (err) {
+          region = null;
+          status.textContent = `Failed to open ${file.name}: ${err.message || err}`;
+        }
+      });
+
+      canvas.addEventListener('click', async (ev) => {
+        if (!region) return;
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor(((ev.clientX - rect.left) / rect.width) * REGION_CHUNKS);
+        const z = Math.floor(((ev.clientY - rect.top) / rect.height) * REGION_CHUNKS);
+        try {
+          const chunk = await readChunk(region, x, z);
+          if (chunk === null) {
+            status.textContent = `Chunk (${x}, ${z}): not generated.`;
+            return;
+          }
+          drawRegion();
+          ctx.fillStyle = '#e8c47a';
+          ctx.fillRect(x * CELL + 1, z * CELL + 1, CELL - 2, CELL - 2);
+          status.textContent =
+            `Chunk (${x}, ${z})\n` +
+            `  compressed:   ${chunk.compressedSize.toLocaleString()} B (type ${chunk.type})\n` +
+            `  decompressed: ${chunk.nbt.byteLength.toLocaleString()} B in ${chunk.ms.toFixed(2)} ms\n` +
+            `  modified:     ${new Date(chunk.timestamp * 1000).toISOString()}\n` +
+            `  NBT head:     ${hex(chunk.nbt.subarray(0, 16))}`;
+        } catch (err) {
+          status.textContent = `Chunk (${x}, ${z}) failed: ${err.message || err}`;
+        }
+      });
+    </script>
   </body>
 </html>

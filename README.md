@@ -18,6 +18,7 @@ draw calls.
 ## Architecture
 
 ```
+index.html                 Region inspector — just open it in a browser
 src/
   index.ts                 Public API
   io/
@@ -32,7 +33,6 @@ src/
     pool.ts                Generic Web Worker pool (transfer-based, FIFO queue)
     region-worker.ts       Off-thread chunk decompression
     region-pool.ts         Pool-backed ChunkDecompressor factory
-demo/                      Phase 1 region inspector (npm run dev)
 test/                      Vitest suite with synthetic in-memory region files
 ```
 
@@ -44,8 +44,6 @@ test/                      Vitest suite with synthetic in-memory region files
   zero-copy `subarray` views into the sector read.
 - **Off-thread inflate.** `createWorkerDecompressor()` moves payloads into workers via
   transfer lists (never structured-clone copies) and transfers result buffers back.
-- **Cross-origin isolation** headers are already configured in Vite for the
-  `SharedArrayBuffer` work coming in Phase 2+.
 
 ## Usage
 
@@ -60,11 +58,21 @@ for (const { x, z } of region.chunks()) {
 }
 ```
 
+## Running it
+
+Download or clone the repo and open `index.html` in a browser. That's it — no install,
+no build, no server. Pick an `.mca` file and click chunks to inspect them.
+
+(`index.html` inlines the Phase 1 pipeline as a classic script because browsers block
+ES module imports and Web Workers on pages opened from disk. The importable library
+in `src/` is the same logic, plus the worker pool for embedding in real apps.)
+
 ## Development
+
+Only needed if you want to run the test suite or build the library package:
 
 ```sh
 npm install
-npm run dev        # region inspector demo at http://localhost:5173
 npm test           # vitest
 npm run typecheck  # tsc --noEmit
 npm run build      # emit dist/ with declarations
