@@ -1124,6 +1124,24 @@
         'quartz_block': 'quartz_block_top', 'nether_quartz_ore': 'nether_quartz_ore',
       };
 
+      // Partial-block variants (stairs, slabs, walls, fences, etc.) reuse their
+      // base material's full-block texture. Strip the variant suffix and map a few
+      // pluralisation quirks so e.g. oak_stairs → oak_planks, stone_brick_slab →
+      // stone_bricks. We still render them as full cubes (the mesher has no
+      // partial-block geometry), but at least they get the right material texture.
+      const VARIANT_SUFFIX = ['_stairs', '_slab', '_wall', '_fence_gate', '_fence',
+        '_pressure_plate', '_button', '_trapdoor', '_door'];
+      function baseMaterial(short) {
+        for (const suf of VARIANT_SUFFIX) {
+          if (short.endsWith(suf)) {
+            const base = short.slice(0, -suf.length);
+            // Wood variants use *_planks; brick/quartz/etc. keep/repluralise.
+            return [base + '_planks', base + 's', base, base + '_top'];
+          }
+        }
+        return null;
+      }
+
       function textureCandidates(blockName) {
         const short = blockName.startsWith('minecraft:') ? blockName.slice(10) : blockName;
         const names = [];
@@ -1133,6 +1151,8 @@
         names.push(short + '_side');
         names.push(short + '_still');  // fluids: water_still / lava_still
         names.push(short + '_flow');
+        const base = baseMaterial(short);
+        if (base) names.push(...base); // stairs/slabs/etc. → base material texture
         return names;
       }
 
