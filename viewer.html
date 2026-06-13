@@ -327,7 +327,8 @@
         'minecraft:slime_block', 'minecraft:honey_block']);
       const TRANSPARENT_SUFFIX = ['_leaves', '_glass', '_glass_pane'];
       const FLUID = new Set(['minecraft:water', 'minecraft:lava',
-        'minecraft:flowing_water', 'minecraft:flowing_lava']);
+        'minecraft:flowing_water', 'minecraft:flowing_lava',
+        'minecraft:bubble_column']); // water with bubbles — render as a water surface
       // Blocks rendered as a criss-cross of two diagonal quads, the way Minecraft
       // draws plants. Suffix matches catch the *_sapling / *_flower-ish families.
       const CROSS = new Set(['minecraft:grass', 'minecraft:short_grass', 'minecraft:tall_grass',
@@ -340,7 +341,9 @@
         'minecraft:brown_mushroom', 'minecraft:red_mushroom', 'minecraft:seagrass',
         'minecraft:bush', 'minecraft:firefly_bush', 'minecraft:short_dry_grass',
         'minecraft:tall_dry_grass', 'minecraft:cactus_flower', 'minecraft:wildflowers',
-        'minecraft:leaf_litter']);
+        'minecraft:leaf_litter', 'minecraft:tall_seagrass', 'minecraft:kelp',
+        'minecraft:kelp_plant', 'minecraft:hanging_roots', 'minecraft:spore_blossom',
+        'minecraft:pink_petals']);
       // Suffix/substring patterns so most plant families are caught without
       // listing every block (and every mod block) by name.
       const CROSS_SUFFIX = ['_sapling', '_tulip', '_mushroom', '_fern', '_bush',
@@ -385,7 +388,9 @@
         'minecraft:large_fern': 0x7cbd6b, 'minecraft:vine': 0x7cbd6b,
         'minecraft:sugar_cane': 0x91bd59, 'minecraft:lily_pad': 0x509a30,
         'minecraft:bush': 0x7cbd6b, 'minecraft:firefly_bush': 0x7cbd6b,
-        'minecraft:leaf_litter': 0x9a7a4a,
+        'minecraft:leaf_litter': 0x9a7a4a, 'minecraft:bubble_column': 0x3f76e4,
+        'minecraft:tall_seagrass': 0x4f9e3a, 'minecraft:seagrass': 0x4f9e3a,
+        'minecraft:kelp': 0x4f9e3a, 'minecraft:kelp_plant': 0x4f9e3a,
       };
       const HASH_COLORS = new Map();
       function colorForName(name) {
@@ -412,6 +417,8 @@
         'minecraft:water', 'minecraft:flowing_water', 'minecraft:bubble_column',
         'minecraft:vine', 'minecraft:lily_pad', 'minecraft:sugar_cane',
         'minecraft:bush', 'minecraft:firefly_bush', 'minecraft:leaf_litter',
+        'minecraft:tall_seagrass', 'minecraft:seagrass', 'minecraft:kelp',
+        'minecraft:kelp_plant',
       ]);
       const TINTED_SUFFIX = ['_leaves'];
       function tintForName(name) {
@@ -1197,12 +1204,25 @@
 
         let found = 0;
         for (let layer = 0; layer < layerCount; layer++) {
-          if (paths[layer] === null) continue; // leave transparent → flat-color fallback
-          const isFluid = classifyName(LAYER_NAMES[layer]) === CLASS_FLUID;
+          const name = LAYER_NAMES[layer];
           let pixels = null;
-          try { pixels = await decodeTile(paths[layer], isFluid); } catch {}
-          if (pixels === null) continue;
-          found++;
+          if (paths[layer] !== null) {
+            const isFluid = classifyName(name) === CLASS_FLUID;
+            try { pixels = await decodeTile(paths[layer], isFluid); found++; } catch {}
+          }
+          // No texture found → fill the layer with the block's flat colour at full
+          // alpha. The shader samples every block whose layer >= 0, so an unfilled
+          // (transparent) layer would be discarded and the block would vanish —
+          // that was the bubble_column / any-unmatched-block see-through bug.
+          if (pixels === null) {
+            // Tinted blocks get multiplied by their flat colour in the shader, so
+            // fill them white (tint × white = the tint colour); untinted blocks
+            // get the flat colour directly.
+            const col = tintForName(name) ? 0xffffff : colorForName(name);
+            pixels = new Uint8Array(TILE * TILE * 4);
+            const r = (col >> 16) & 0xff, g = (col >> 8) & 0xff, b = col & 0xff;
+            for (let i = 0; i < pixels.length; i += 4) { pixels[i]=r; pixels[i+1]=g; pixels[i+2]=b; pixels[i+3]=255; }
+          }
           gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, TILE, TILE, 1,
             gl.RGBA, gl.UNSIGNED_BYTE, pixels);
         }
