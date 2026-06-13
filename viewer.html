@@ -15,6 +15,9 @@
       canvas { display: block; width: 100vw; height: 100vh; }
       #hint { position: fixed; bottom: 10px; left: 12px; font-size: 12px;
         color: #7a7a88; z-index: 10; }
+      #pick { position: fixed; bottom: 34px; left: 12px; font-size: 14px;
+        color: #e8c47a; z-index: 10; background: rgba(16,16,22,0.7);
+        padding: 4px 8px; border-radius: 4px; }
       a { color: #8aa6ff; }
     </style>
   </head>
@@ -27,7 +30,8 @@
       <span style="margin-left:auto"><a href="index.html">2D map →</a></span>
     </div>
     <canvas id="gl"></canvas>
-    <div id="hint">drag to orbit · scroll to zoom · right-drag, Ctrl-drag, or WASD to pan · R to reset · load a resource pack for textures</div>
+    <div id="pick">click a block to identify it</div>
+    <div id="hint">drag to orbit · click a block to identify · scroll to zoom · right-drag, Ctrl-drag, or WASD to pan · R to reset · load a resource pack for textures</div>
 
     <!--
       Self-contained 3D region viewer. Runs straight from disk (file://): WebGL
@@ -333,8 +337,14 @@
         'minecraft:azure_bluet', 'minecraft:oxeye_daisy', 'minecraft:lily_of_the_valley',
         'minecraft:red_tulip', 'minecraft:orange_tulip', 'minecraft:white_tulip',
         'minecraft:pink_tulip', 'minecraft:sweet_berry_bush', 'minecraft:nether_wart',
-        'minecraft:brown_mushroom', 'minecraft:red_mushroom', 'minecraft:seagrass']);
-      const CROSS_SUFFIX = ['_sapling'];
+        'minecraft:brown_mushroom', 'minecraft:red_mushroom', 'minecraft:seagrass',
+        'minecraft:bush', 'minecraft:firefly_bush', 'minecraft:short_dry_grass',
+        'minecraft:tall_dry_grass', 'minecraft:cactus_flower', 'minecraft:wildflowers',
+        'minecraft:leaf_litter']);
+      // Suffix/substring patterns so most plant families are caught without
+      // listing every block (and every mod block) by name.
+      const CROSS_SUFFIX = ['_sapling', '_tulip', '_mushroom', '_fern', '_bush',
+        '_grass', '_flower', '_roots', '_sprouts', '_fungus'];
       // Skipped entirely: things the cube/cross mesher can't represent well.
       const NON_SOLID = new Set(['minecraft:fire', 'minecraft:redstone_wire', 'minecraft:rail',
         'minecraft:torch', 'minecraft:wall_torch', 'minecraft:ladder', 'minecraft:snow']);
@@ -367,6 +377,15 @@
         'minecraft:terracotta': 0x985e43, 'minecraft:water': 0x3f76e4, 'minecraft:obsidian': 0x15121e,
         'minecraft:mud': 0x3c393c, 'minecraft:moss_block': 0x596d2d, 'minecraft:podzol': 0x5a3f23,
         'minecraft:mycelium': 0x6f6369, 'minecraft:calcite': 0xdfe0dc, 'minecraft:tuff': 0x6c6e67,
+        // Tintable foliage ships greyscale and is multiplied by these flat biome
+        // greens in the shader. Without an entry here they'd fall back to a muddy
+        // hash colour and render grey (the bug for short_grass et al.).
+        'minecraft:grass': 0x7cbd6b, 'minecraft:short_grass': 0x7cbd6b,
+        'minecraft:tall_grass': 0x7cbd6b, 'minecraft:fern': 0x7cbd6b,
+        'minecraft:large_fern': 0x7cbd6b, 'minecraft:vine': 0x7cbd6b,
+        'minecraft:sugar_cane': 0x91bd59, 'minecraft:lily_pad': 0x509a30,
+        'minecraft:bush': 0x7cbd6b, 'minecraft:firefly_bush': 0x7cbd6b,
+        'minecraft:leaf_litter': 0x9a7a4a,
       };
       const HASH_COLORS = new Map();
       function colorForName(name) {
@@ -392,6 +411,7 @@
         'minecraft:tall_grass', 'minecraft:fern', 'minecraft:large_fern',
         'minecraft:water', 'minecraft:flowing_water', 'minecraft:bubble_column',
         'minecraft:vine', 'minecraft:lily_pad', 'minecraft:sugar_cane',
+        'minecraft:bush', 'minecraft:firefly_bush', 'minecraft:leaf_litter',
       ]);
       const TINTED_SUFFIX = ['_leaves'];
       function tintForName(name) {
@@ -425,6 +445,7 @@
         const baseY = minY * 16;
 
         const idByName = new Map([['', 0]]);
+        const names = ['']; // global id → block name (for click-to-identify)
         const classes = [CLASS_EMPTY];
         const colors = [0];
         const layers = [-1]; // id 0 is empty → no texture layer
@@ -442,6 +463,7 @@
             if (gid === undefined) {
               gid = classes.length;
               idByName.set(name, gid);
+              names.push(name);
               classes.push(cls);
               colors.push(colorForName(name));
               layers.push(layerForName(name));
@@ -468,7 +490,7 @@
             }
         }
         return {
-          sizeX: 16, sizeY, sizeZ: 16, baseY,
+          sizeX: 16, sizeY, sizeZ: 16, baseY, names,
           ids, classes: Uint8Array.from(classes), colors: Uint32Array.from(colors),
           layers: Int16Array.from(layers), tints: Uint8Array.from(tints),
           strideZ, strideY,
@@ -690,6 +712,44 @@
         return o;
       }
 
+      // Full 4x4 inverse (column-major). Returns null if singular.
+      function mat4Invert(m) {
+        const inv = new Float32Array(16);
+        inv[0]=m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
+        inv[4]=-m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
+        inv[8]=m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
+        inv[12]=-m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
+        inv[1]=-m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
+        inv[5]=m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
+        inv[9]=-m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
+        inv[13]=m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
+        inv[2]=m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
+        inv[6]=-m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
+        inv[10]=m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
+        inv[14]=-m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
+        inv[3]=-m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
+        inv[7]=m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
+        inv[11]=-m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
+        inv[15]=m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
+        let det = m[0]*inv[0]+m[1]*inv[4]+m[2]*inv[8]+m[3]*inv[12];
+        if (det === 0) return null;
+        det = 1/det;
+        for (let i = 0; i < 16; i++) inv[i] *= det;
+        return inv;
+      }
+
+      // Transform a point by a column-major mat4, returning [x,y,z] after the
+      // perspective divide.
+      function mat4TransformPoint(m, x, y, z) {
+        const ix = m[0]*x+m[4]*y+m[8]*z+m[12];
+        const iy = m[1]*x+m[5]*y+m[9]*z+m[13];
+        const iz = m[2]*x+m[6]*y+m[10]*z+m[14];
+        const iw = m[3]*x+m[7]*y+m[11]*z+m[15];
+        const w = iw || 1;
+        return [ix/w, iy/w, iz/w];
+      }
+      let lastViewProj = null; // set each frame; pickBlock unprojects through it
+
       // WebGL2 / GLSL ES 3.00. The texture array holds one 16x16 layer per block
       // type; aLayer selects it. aUV runs 0..w / 0..h so REPEAT tiles the tile
       // once per block across greedy-merged quads. A negative layer means the
@@ -767,6 +827,7 @@
 
       const canvas = document.getElementById('gl');
       const statusEl = document.getElementById('status');
+      const pickEl = document.getElementById('pick');
       const gl = canvas.getContext('webgl2', { antialias: true });
       if (!gl) statusEl.textContent = 'WebGL2 is not available in this browser.';
 
@@ -798,6 +859,11 @@
       // One GPU-resident chunk: a VAO wrapping its attribute buffers, plus a
       // bounding sphere for frustum culling.
       const chunkMeshes = [];
+      // For click-to-identify we keep each chunk's lean voxel grid (just the `ids`
+      // typed array it already built while meshing, plus its name table + origin).
+      // No per-voxel work at load time — we only read a cell when you actually
+      // click. Keyed by "cx,cz". Cleared on region reload.
+      const pickGrids = new Map();
 
       function makeBuffer(target, data, location, size, type, normalized) {
         const buf = gl.createBuffer();
@@ -847,6 +913,7 @@
           for (const b of m.buffers) gl.deleteBuffer(b);
         }
         chunkMeshes.length = 0;
+        pickGrids.clear();
       }
 
       // --- orbit camera ---
@@ -860,6 +927,83 @@
           cam.target[1] + cam.dist * sp,
           cam.target[2] + cam.dist * cp * cy,
         ];
+      }
+
+      // The camera's right and up unit vectors (screen-space pan basis). Forward
+      // points from eye to target; right = forward × worldUp, up = right × forward.
+      function cameraRightUp() {
+        const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+        const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+        // Forward = target - eye = -(cp*sy, sp, cp*cy).
+        const fx = -cp * sy, fy = -sp, fz = -cp * cy;
+        // right = normalize(forward × up), up = (0,1,0).
+        let rx = fz, ry = 0, rz = -fx; // forward × (0,1,0)
+        const rl = Math.hypot(rx, ry, rz) || 1; rx /= rl; ry /= rl; rz /= rl;
+        // camUp = right × forward.
+        const ux = ry * fz - rz * fy;
+        const uy = rz * fx - rx * fz;
+        const uz = rx * fy - ry * fx;
+        return [rx, ry, rz, ux, uy, uz];
+      }
+
+      // Looks up the block name at a world voxel by indexing the owning chunk's
+      // retained grid. Only touched on click — no per-voxel work at load.
+      function blockAtWorld(wx, wy, wz) {
+        const cx = Math.floor(wx / 16), cz = Math.floor(wz / 16);
+        const g = pickGrids.get(cx + ',' + cz);
+        if (!g) return null;
+        const lx = wx - cx * 16, lz = wz - cz * 16, ly = wy - g.baseY;
+        if (ly < 0 || ly >= g.sizeY) return null;
+        const id = g.idAt(lx, ly, lz);
+        if (id === 0) return null;
+        return { name: g.names[id] };
+      }
+
+      // Casts a ray from the camera through a clicked pixel and DDA-marches the
+      // voxel grid (Amanatides–Woo) to the first non-empty block. Returns its
+      // name and world coords, or null on a miss.
+      function pickBlock(clientX, clientY) {
+        if (!lastViewProj) return null;
+        const rect = canvas.getBoundingClientRect();
+        const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+        const ndcY = 1 - ((clientY - rect.top) / rect.height) * 2;
+        // Unproject through the SAME view-projection the frame was drawn with, so
+        // the ray provably matches what's on screen (no hand-rolled basis to get
+        // a sign wrong). Two NDC depths give two world points → ray.
+        const invVP = mat4Invert(lastViewProj);
+        if (!invVP) return null;
+        const near = mat4TransformPoint(invVP, ndcX, ndcY, -1);
+        const far  = mat4TransformPoint(invVP, ndcX, ndcY,  1);
+        const eye = near;
+        let dx = far[0]-near[0], dy = far[1]-near[1], dz = far[2]-near[2];
+        const dl = Math.hypot(dx,dy,dz) || 1; dx/=dl; dy/=dl; dz/=dl;
+
+        // DDA through unit voxels.
+        let vx = Math.floor(eye[0]), vy = Math.floor(eye[1]), vz = Math.floor(eye[2]);
+        const stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
+        const tDeltaX = dx !== 0 ? Math.abs(1/dx) : Infinity;
+        const tDeltaY = dy !== 0 ? Math.abs(1/dy) : Infinity;
+        const tDeltaZ = dz !== 0 ? Math.abs(1/dz) : Infinity;
+        const fracX = dx > 0 ? (vx+1-eye[0]) : (eye[0]-vx);
+        const fracY = dy > 0 ? (vy+1-eye[1]) : (eye[1]-vy);
+        const fracZ = dz > 0 ? (vz+1-eye[2]) : (eye[2]-vz);
+        let tMaxX = dx !== 0 ? tDeltaX*fracX : Infinity;
+        let tMaxY = dy !== 0 ? tDeltaY*fracY : Infinity;
+        let tMaxZ = dz !== 0 ? tDeltaZ*fracZ : Infinity;
+
+        const MAX_DIST = 4000;
+        for (let i = 0; i < MAX_DIST; i++) {
+          const hit = blockAtWorld(vx, vy, vz);
+          if (hit) return { ...hit, x: vx, y: vy, z: vz };
+          if (tMaxX < tMaxY) {
+            if (tMaxX < tMaxZ) { vx += stepX; tMaxX += tDeltaX; }
+            else { vz += stepZ; tMaxZ += tDeltaZ; }
+          } else {
+            if (tMaxY < tMaxZ) { vy += stepY; tMaxY += tDeltaY; }
+            else { vz += stepZ; tMaxZ += tDeltaZ; }
+          }
+        }
+        return null;
       }
 
       // Extract the 6 frustum planes from a view-projection matrix (Gribb-Hartmann).
@@ -903,6 +1047,7 @@
         const proj = mat4Perspective(Math.PI / 3, aspect, 1, 6000);
         const view = mat4LookAt(cameraEye(), cam.target, [0, 1, 0]);
         const viewProj = mat4Multiply(proj, view);
+        lastViewProj = viewProj; // reused by pickBlock so picking matches the view exactly
         const frustum = extractFrustum(viewProj);
 
         gl.useProgram(program);
@@ -1139,6 +1284,7 @@
                 const mesh = greedyMesh(grid);
                 if (mesh.quadCount > 0) {
                   const ox = cx * 16, oz = cz * 16;
+                  pickGrids.set(cx + ',' + cz, grid); // ref only; read on click
                   uploadMesh(mesh, ox, oz);
                   quads += mesh.quadCount;
                   sumX += ox + 8; sumZ += oz + 8; n++;
@@ -1158,6 +1304,14 @@
         if (token !== loadToken) return;
 
         if (n > 0) { cam.target[0] = sumX / n; cam.target[2] = sumZ / n; cam.dist = 700; }
+
+        // Debug: dump every distinct block name + its class so we can see exactly
+        // what's in the region (e.g. which surface/lichen/vine blocks exist).
+        const CLS = ['empty','opaque','transparent','cross','fluid'];
+        const seen = [...new Set(LAYER_NAMES)].sort();
+        console.log(`[blocks] ${seen.length} distinct rendered types:`);
+        console.table(seen.map((nm) => ({ name: nm, class: CLS[classifyName(nm)] })));
+
         const secs = ((performance.now() - t0) / 1000).toFixed(2);
         let msg = `${file.name}: ${total} chunks, ${quads.toLocaleString()} quads in ${secs} s` +
           (failed ? ` (${failed} unreadable)` : '');
@@ -1183,6 +1337,7 @@
       // ============ camera controls ============
 
       let dragging = false, panning = false, lastX = 0, lastY = 0;
+      let downX = 0, downY = 0, moved = 0; // to tell a click from a drag
       canvas.addEventListener('contextmenu', (e) => e.preventDefault());
       canvas.addEventListener('pointerdown', (ev) => {
         // Left button orbits, unless Ctrl/Meta is held — then it pans, like the
@@ -1191,26 +1346,44 @@
         panning = wantPan;
         dragging = ev.button === 0 && !wantPan;
         lastX = ev.clientX; lastY = ev.clientY;
+        downX = ev.clientX; downY = ev.clientY; moved = 0;
         canvas.setPointerCapture(ev.pointerId);
       });
       canvas.addEventListener('pointermove', (ev) => {
         if (!dragging && !panning) return;
         const dx = ev.clientX - lastX, dy = ev.clientY - lastY;
         lastX = ev.clientX; lastY = ev.clientY;
+        moved += Math.abs(dx) + Math.abs(dy);
         if (dragging) {
           cam.yaw -= dx * 0.005;
           cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy * 0.005));
         } else {
-          // Pan across the ground plane, scaled by distance. dx moves along the
-          // camera's right axis, dy along its forward axis; both signs chosen so
-          // the world follows the cursor (drag down → view moves down).
+          // Screen-space pan: move the target along the camera's right and up
+          // axes so horizontal drag slides sideways and vertical drag moves
+          // up/down on screen (not forward/back). Scaled by distance so the
+          // world tracks the cursor at any zoom.
           const s = cam.dist * 0.0015;
-          const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
-          cam.target[0] -= (dx * cy + dy * sy) * s;
-          cam.target[2] += (dx * sy - dy * cy) * s;
+          const [rx, ry, rz, ux, uy, uz] = cameraRightUp();
+          cam.target[0] -= dx * rx * s + dy * ux * s;
+          cam.target[1] -= dx * ry * s + dy * uy * s;
+          cam.target[2] -= dx * rz * s + dy * uz * s;
         }
       });
-      canvas.addEventListener('pointerup', () => { dragging = panning = false; });
+      canvas.addEventListener('pointerup', (ev) => {
+        const wasLeftClick = dragging || (ev.button === 0);
+        dragging = panning = false;
+        // A left click that didn't drag (< 5px total) identifies a block.
+        if (wasLeftClick && ev.button === 0 && moved < 5 && pickGrids.size > 0) {
+          const hit = pickBlock(ev.clientX, ev.clientY);
+          if (hit) {
+            const short = hit.name.replace(/^minecraft:/, '');
+            const cls = ['empty','opaque','transparent','cross','fluid'][classifyName(hit.name)] || '?';
+            pickEl.textContent = `${short}  [${cls}]  @ ${hit.x}, ${hit.y}, ${hit.z}`;
+          } else {
+            pickEl.textContent = '(no block — clicked the sky)';
+          }
+        }
+      });
       canvas.addEventListener('wheel', (ev) => {
         ev.preventDefault();
         cam.dist = Math.max(20, Math.min(4000, cam.dist * Math.pow(1.1, ev.deltaY / 100)));
