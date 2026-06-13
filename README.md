@@ -6,6 +6,14 @@ High-efficiency, browser-native voxel rendering engine for Minecraft worlds.
 allocation, Web Workers over main-thread work. The main thread is reserved for UI and WebGL
 draw calls.
 
+## Screenshots
+
+![Top-down 2D terrain map](docs/2dview.png)
+*The 2D region inspector (`index.html`) — top-down terrain map with hillshading.*
+
+![3D WebGL region view](docs/3dview.png)
+*The 3D viewer (`viewer.html`) — greedy-meshed chunks rendered in WebGL.*
+
 ## Roadmap status
 
 | Phase | Scope | Status |
