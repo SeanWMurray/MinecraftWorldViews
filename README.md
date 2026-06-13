@@ -18,10 +18,10 @@ draw calls.
 
 | Phase | Scope | Status |
 | ----- | ----- | ------ |
-| 1. I/O & decompression | Stream `.mca` region files, ranged reads, native `DecompressionStream`, worker pool | ya |
-| 2. NBT & blockstates | Lazy NBT parser, bit-packed palette extraction | kinda |
-| 3. Geometry & meshing | Greedy meshing + internal-face & transparency culling | ya |
-| 4. WebGL rendering | WebGL2, per-chunk buffers, frustum culling, texture-array textures + mipmaps | kinda |
+| 1. I/O & decompression | Stream `.mca` region files, ranged reads, native `DecompressionStream`, worker pool | x |
+| 2. NBT & blockstates | Lazy NBT parser, bit-packed palette extraction | x |
+| 3. Geometry & meshing | Greedy meshing + internal-face & transparency culling | x |
+| 4. WebGL rendering | WebGL2, per-chunk buffers, frustum culling, texture-array textures + mipmaps | x |
 
 ## Architecture
 
