@@ -34,6 +34,19 @@ export {
   type ParsedChunk,
 } from './nbt/chunk';
 
+// Phase 3: geometry & greedy meshing.
+export {
+  meshChunk,
+  greedyMesh,
+  VoxelGrid,
+  BlockClass,
+  classifyState,
+  colorForName,
+  buildPaletteInfo,
+  type ChunkMesh,
+  type PaletteInfo,
+} from './mesh/index';
+
 // Concurrency.
 export { WorkerPool } from './worker/pool';
 export { createRegionWorkerPool, type RegionWorkerPool } from './worker/region-pool';

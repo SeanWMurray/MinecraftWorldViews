@@ -18,15 +18,16 @@
       canvas { display: block; margin: 1rem 0; cursor: crosshair; image-rendering: pixelated; }
       pre { white-space: pre-wrap; word-break: break-all; color: #9fd6a8; }
       code { color: #e8c47a; }
+      a { color: #8aa6ff; }
     </style>
   </head>
   <body>
-    <h1>MinecraftWorldViews <small>— region inspector</small></h1>
+    <h1>MinecraftWorldViews <small>— region inspector</small> <a href="viewer.html" style="float:right;font-size:0.85rem">3D viewer →</a></h1>
     <p>
       Open a region file (<code>.mca</code>) from your world's <code>region/</code> folder
       to render a top-down terrain map (one pixel per block). Scroll to zoom, drag to pan,
       double-click to reset, click to inspect a block column. Supports worlds from
-      Minecraft 1.16 onwards.
+      Minecraft 1.16 onwards. Want a 3D view? Open <a href="viewer.html">viewer.html</a>.
     </p>
     <input id="file" type="file" accept=".mca,.mcr" />
     <canvas id="grid" width="512" height="512"></canvas>

@@ -1,0 +1,778 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MinecraftWorldViews — 3D Region Viewer</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0c0c10; color: #d8d8e0;
+        font-family: ui-monospace, Consolas, monospace; }
+      #bar { position: fixed; top: 0; left: 0; right: 0; padding: 8px 12px;
+        background: rgba(16,16,22,0.85); display: flex; gap: 12px; align-items: center;
+        font-size: 13px; z-index: 10; backdrop-filter: blur(4px); }
+      #bar code { color: #e8c47a; }
+      #status { color: #9fd6a8; }
+      canvas { display: block; width: 100vw; height: 100vh; }
+      #hint { position: fixed; bottom: 10px; left: 12px; font-size: 12px;
+        color: #7a7a88; z-index: 10; }
+      a { color: #8aa6ff; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <span>3D viewer —</span>
+      <input id="file" type="file" accept=".mca,.mcr" />
+      <span id="status">Pick an <code>.mca</code> file from your world's <code>region/</code> folder.</span>
+      <span style="margin-left:auto"><a href="index.html">2D map →</a></span>
+    </div>
+    <canvas id="gl"></canvas>
+    <div id="hint">drag to orbit · scroll to zoom · right-drag or WASD to pan · R to reset</div>
+
+    <!--
+      Self-contained 3D region viewer. Runs straight from disk (file://): WebGL
+      has no module/worker restrictions, so this inlines the Phase 1-3 pipeline
+      (region I/O, lazy NBT parse, greedy meshing) as a classic script and
+      renders with raw WebGL. The same logic lives, typed and modular, in src/.
+    -->
+    <script>
+      'use strict';
+
+      // ============ Phase 1: region I/O & decompression (mirrors src/io/) ============
+
+      const SECTOR_SIZE = 4096;
+      const HEADER_SIZE = SECTOR_SIZE * 2;
+      const chunkIndex = (x, z) => (x & 31) | ((z & 31) << 5);
+
+      async function readRange(file, offset, length) {
+        return new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+      }
+
+      async function openRegion(file) {
+        const header = await readRange(file, 0, HEADER_SIZE);
+        if (header.byteLength < HEADER_SIZE) throw new Error(`region file too small`);
+        const view = new DataView(header.buffer);
+        const locations = new Uint32Array(1024);
+        for (let i = 0; i < 1024; i++) locations[i] = view.getUint32(i * 4);
+        return { file, locations };
+      }
+
+      function compressionFormat(type) {
+        switch (type) {
+          case 1: return 'gzip';
+          case 2: return 'deflate';
+          case 3: return null;
+          default: throw new Error(`unsupported chunk compression type ${type}`);
+        }
+      }
+
+      async function inflate(data, format) {
+        const stream = new Response(data).body.pipeThrough(new DecompressionStream(format));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+
+      async function readChunkNbt(region, x, z) {
+        const entry = region.locations[chunkIndex(x, z)];
+        if (entry === 0) return null;
+        const sectorOffset = entry >>> 8, sectorCount = entry & 0xff;
+        if (sectorOffset < 2 || sectorCount === 0) throw new Error(`corrupt location (${x},${z})`);
+        const data = await readRange(region.file, sectorOffset * SECTOR_SIZE, sectorCount * SECTOR_SIZE);
+        if (data.byteLength < 5) throw new Error(`truncated chunk (${x},${z})`);
+        const length = new DataView(data.buffer).getUint32(0);
+        if (length < 1 || 4 + length > data.byteLength) throw new Error(`corrupt chunk (${x},${z})`);
+        const type = data[4];
+        if ((type & 0x80) !== 0) throw new Error(`chunk (${x},${z}) is external (.mcc)`);
+        const payload = data.subarray(5, 4 + length);
+        const format = compressionFormat(type);
+        return format === null ? payload : await inflate(payload, format);
+      }
+
+      // ============ Phase 2: lazy NBT chunk parser (mirrors src/nbt/) ============
+
+      const TAG_END = 0, TAG_BYTE = 1, TAG_SHORT = 2, TAG_INT = 3, TAG_LONG = 4,
+        TAG_FLOAT = 5, TAG_DOUBLE = 6, TAG_BYTE_ARRAY = 7, TAG_STRING = 8,
+        TAG_LIST = 9, TAG_COMPOUND = 10, TAG_INT_ARRAY = 11, TAG_LONG_ARRAY = 12;
+
+      function nbtReader(data) {
+        return { data, view: new DataView(data.buffer, data.byteOffset, data.byteLength), pos: 0 };
+      }
+      const u8 = (r) => r.data[r.pos++];
+      const i8 = (r) => r.view.getInt8(r.pos++);
+      const u16 = (r) => { const v = r.view.getUint16(r.pos); r.pos += 2; return v; };
+      const i32 = (r) => { const v = r.view.getInt32(r.pos); r.pos += 4; return v; };
+      function readStr(r) {
+        const n = u16(r);
+        let s = '';
+        for (let i = 0; i < n; i++) s += String.fromCharCode(r.data[r.pos + i]);
+        r.pos += n;
+        return s;
+      }
+      const skipStr = (r) => { r.pos += 2 + r.view.getUint16(r.pos); };
+
+      function skipValue(r, type) {
+        switch (type) {
+          case TAG_BYTE: r.pos += 1; return;
+          case TAG_SHORT: r.pos += 2; return;
+          case TAG_INT: case TAG_FLOAT: r.pos += 4; return;
+          case TAG_LONG: case TAG_DOUBLE: r.pos += 8; return;
+          case TAG_BYTE_ARRAY: r.pos += 4 + r.view.getInt32(r.pos); return;
+          case TAG_STRING: skipStr(r); return;
+          case TAG_LIST: {
+            const itemType = u8(r), count = i32(r);
+            if (count <= 0) return;
+            switch (itemType) {
+              case TAG_BYTE: r.pos += count; return;
+              case TAG_SHORT: r.pos += count * 2; return;
+              case TAG_INT: case TAG_FLOAT: r.pos += count * 4; return;
+              case TAG_LONG: case TAG_DOUBLE: r.pos += count * 8; return;
+              default: for (let i = 0; i < count; i++) skipValue(r, itemType); return;
+            }
+          }
+          case TAG_COMPOUND:
+            for (;;) {
+              const id = u8(r);
+              if (id === TAG_END) return;
+              skipStr(r);
+              skipValue(r, id);
+            }
+          case TAG_INT_ARRAY: r.pos += 4 + r.view.getInt32(r.pos) * 4; return;
+          case TAG_LONG_ARRAY: r.pos += 4 + r.view.getInt32(r.pos) * 8; return;
+          default: throw new Error(`invalid NBT tag ${type} at byte ${r.pos}`);
+        }
+      }
+
+      const bitsForPalette = (size) => Math.max(4, 32 - Math.clz32(size - 1));
+
+      function unpackPackedInts(view, byteOffset, longCount, bits, out) {
+        const entriesPerLong = (64 / bits) | 0;
+        const mask = (1 << bits) - 1;
+        let i = 0;
+        for (let l = 0; l < longCount && i < out.length; l++) {
+          const hi = view.getUint32(byteOffset + l * 8);
+          const lo = view.getUint32(byteOffset + l * 8 + 4);
+          for (let e = 0; e < entriesPerLong && i < out.length; e++) {
+            const bit = e * bits;
+            out[i++] =
+              bit + bits <= 32 ? (lo >>> bit) & mask :
+              bit >= 32 ? (hi >>> (bit - 32)) & mask :
+              ((lo >>> bit) | (hi << (32 - bit))) & mask;
+          }
+        }
+      }
+
+      function readPalette(r) {
+        const itemType = u8(r), count = i32(r);
+        const palette = [];
+        if (itemType !== TAG_COMPOUND) {
+          for (let i = 0; i < count; i++) skipValue(r, itemType);
+          return palette;
+        }
+        for (let i = 0; i < count; i++) {
+          let name = '';
+          for (;;) {
+            const id = u8(r);
+            if (id === TAG_END) break;
+            const key = readStr(r);
+            if (id === TAG_STRING && key === 'Name') name = readStr(r);
+            else skipValue(r, id);
+          }
+          palette.push(name);
+        }
+        return palette;
+      }
+
+      function readSection(r) {
+        let y = 0, palette = null, dataOffset = -1, dataLongs = 0;
+        for (;;) {
+          const id = u8(r);
+          if (id === TAG_END) break;
+          const name = readStr(r);
+          if (id === TAG_BYTE && name === 'Y') y = i8(r);
+          else if (id === TAG_COMPOUND && name === 'block_states') {
+            for (;;) {
+              const innerId = u8(r);
+              if (innerId === TAG_END) break;
+              const innerName = readStr(r);
+              if (innerId === TAG_LIST && innerName === 'palette') palette = readPalette(r);
+              else if (innerId === TAG_LONG_ARRAY && innerName === 'data') {
+                dataLongs = i32(r); dataOffset = r.pos; r.pos += dataLongs * 8;
+              } else skipValue(r, innerId);
+            }
+          } else if (id === TAG_LIST && name === 'Palette') palette = readPalette(r);
+          else if (id === TAG_LONG_ARRAY && name === 'BlockStates') {
+            dataLongs = i32(r); dataOffset = r.pos; r.pos += dataLongs * 8;
+          } else skipValue(r, id);
+        }
+        if (palette === null || palette.length === 0) return null;
+        let blocks = null;
+        if (palette.length > 1 && dataOffset >= 0) {
+          blocks = new Uint16Array(4096);
+          unpackPackedInts(r.view, dataOffset, dataLongs, bitsForPalette(palette.length), blocks);
+        }
+        return { y, palette, blocks };
+      }
+
+      function readChunkCompound(r, chunk, allowLevel) {
+        for (;;) {
+          const id = u8(r);
+          if (id === TAG_END) return;
+          const name = readStr(r);
+          if (id === TAG_INT && name === 'xPos') chunk.x = i32(r);
+          else if (id === TAG_INT && name === 'zPos') chunk.z = i32(r);
+          else if (id === TAG_LIST && (name === 'sections' || name === 'Sections')) {
+            const itemType = u8(r), count = i32(r);
+            if (itemType === TAG_COMPOUND) {
+              for (let i = 0; i < count; i++) {
+                const section = readSection(r);
+                if (section !== null) chunk.sections.push(section);
+              }
+            } else {
+              for (let i = 0; i < count; i++) skipValue(r, itemType);
+            }
+          } else if (id === TAG_COMPOUND && name === 'Level' && allowLevel) {
+            readChunkCompound(r, chunk, false);
+          } else skipValue(r, id);
+        }
+      }
+
+      function parseChunk(nbt) {
+        const r = nbtReader(nbt);
+        if (u8(r) !== TAG_COMPOUND) throw new Error('chunk NBT must start with a compound');
+        skipStr(r);
+        const chunk = { x: 0, z: 0, sections: [] };
+        readChunkCompound(r, chunk, true);
+        chunk.sections.sort((a, b) => a.y - b.y); // ascending y for meshing
+        return chunk;
+      }
+
+      // ============ Phase 3: block model + greedy meshing (mirrors src/mesh/) ============
+
+      const AIR = new Set(['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air']);
+      // 0 = empty, 1 = opaque, 2 = transparent.
+      const CLASS_EMPTY = 0, CLASS_OPAQUE = 1, CLASS_TRANSPARENT = 2;
+
+      const TRANSPARENT = new Set(['minecraft:glass', 'minecraft:ice', 'minecraft:frosted_ice',
+        'minecraft:slime_block', 'minecraft:honey_block']);
+      const TRANSPARENT_SUFFIX = ['_leaves', '_glass', '_glass_pane'];
+      const NON_SOLID = new Set(['minecraft:water', 'minecraft:lava', 'minecraft:fire',
+        'minecraft:redstone_wire', 'minecraft:rail', 'minecraft:torch', 'minecraft:wall_torch',
+        'minecraft:ladder', 'minecraft:snow']);
+      const NON_SOLID_SUFFIX = ['_sapling', '_button', '_pressure_plate', '_carpet'];
+
+      function classifyName(name) {
+        if (AIR.has(name)) return CLASS_EMPTY;
+        if (NON_SOLID.has(name)) return CLASS_EMPTY;
+        for (const s of NON_SOLID_SUFFIX) if (name.endsWith(s)) return CLASS_EMPTY;
+        if (TRANSPARENT.has(name)) return CLASS_TRANSPARENT;
+        for (const s of TRANSPARENT_SUFFIX) if (name.endsWith(s)) return CLASS_TRANSPARENT;
+        return CLASS_OPAQUE;
+      }
+
+      const BLOCK_COLORS = {
+        'minecraft:stone': 0x7d7d7d, 'minecraft:deepslate': 0x505056, 'minecraft:dirt': 0x866043,
+        'minecraft:grass_block': 0x5d923a, 'minecraft:sand': 0xdbcf8e, 'minecraft:gravel': 0x847e7c,
+        'minecraft:bedrock': 0x383838, 'minecraft:oak_log': 0x6b5430, 'minecraft:spruce_log': 0x3a2510,
+        'minecraft:birch_log': 0xc1b387, 'minecraft:oak_leaves': 0x3c823c,
+        'minecraft:spruce_leaves': 0x2d5a2d, 'minecraft:birch_leaves': 0x6b8d46,
+        'minecraft:oak_planks': 0xa0814d, 'minecraft:cobblestone': 0x6e6e6e,
+        'minecraft:coal_ore': 0x47474a, 'minecraft:iron_ore': 0xb6a187,
+        'minecraft:snow_block': 0xf0f5f5, 'minecraft:snow': 0xf0f5f5, 'minecraft:glass': 0xc7e4ec,
+        'minecraft:ice': 0x9bbdf0, 'minecraft:packed_ice': 0x7dadff, 'minecraft:sandstone': 0xd6ca8a,
+        'minecraft:clay': 0x9aa1ad, 'minecraft:granite': 0x956756, 'minecraft:diorite': 0xbcbcbc,
+        'minecraft:andesite': 0x888889, 'minecraft:netherrack': 0x612626,
+        'minecraft:terracotta': 0x985e43, 'minecraft:water': 0x3f76e4, 'minecraft:obsidian': 0x15121e,
+        'minecraft:mud': 0x3c393c, 'minecraft:moss_block': 0x596d2d, 'minecraft:podzol': 0x5a3f23,
+        'minecraft:mycelium': 0x6f6369, 'minecraft:calcite': 0xdfe0dc, 'minecraft:tuff': 0x6c6e67,
+      };
+      const HASH_COLORS = new Map();
+      function colorForName(name) {
+        const known = BLOCK_COLORS[name];
+        if (known !== undefined) return known;
+        let c = HASH_COLORS.get(name);
+        if (c !== undefined) return c;
+        let h = 0x811c9dc5;
+        for (let i = 0; i < name.length; i++) { h ^= name.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+        const r = 80 + ((h >>> 16) & 0x7f), g = 80 + ((h >>> 8) & 0x7f), b = 80 + (h & 0x7f);
+        c = (r << 16) | (g << 8) | b;
+        HASH_COLORS.set(name, c);
+        return c;
+      }
+
+      // Flatten a parsed chunk into a padded id grid + per-id class/color tables.
+      function buildGrid(chunk) {
+        const sections = chunk.sections;
+        if (sections.length === 0) return null;
+        const minY = sections[0].y, maxY = sections[sections.length - 1].y;
+        const sizeY = (maxY - minY + 1) * 16;
+        const baseY = minY * 16;
+
+        const idByName = new Map([['', 0]]);
+        const classes = [CLASS_EMPTY];
+        const colors = [0];
+        const strideZ = 18, strideY = 18 * 18;
+        const ids = new Uint16Array(strideY * (sizeY + 2));
+
+        for (const s of sections) {
+          const localToGlobal = new Uint16Array(s.palette.length);
+          for (let p = 0; p < s.palette.length; p++) {
+            const cls = classifyName(s.palette[p]);
+            if (cls === CLASS_EMPTY) { localToGlobal[p] = 0; continue; }
+            const name = s.palette[p];
+            let gid = idByName.get(name);
+            if (gid === undefined) {
+              gid = classes.length;
+              idByName.set(name, gid);
+              classes.push(cls);
+              colors.push(colorForName(name));
+            }
+            localToGlobal[p] = gid;
+          }
+          const yOff = (s.y - minY) * 16;
+          if (s.blocks === null) {
+            const gid = localToGlobal[0];
+            if (gid === 0) continue;
+            for (let y = 0; y < 16; y++)
+              for (let z = 0; z < 16; z++) {
+                let o = 1 + (z + 1) * strideZ + (yOff + y + 1) * strideY;
+                for (let x = 0; x < 16; x++) ids[o++] = gid;
+              }
+            continue;
+          }
+          for (let y = 0; y < 16; y++)
+            for (let z = 0; z < 16; z++) {
+              let src = (((y << 4) | z) << 4);
+              let dst = 1 + (z + 1) * strideZ + (yOff + y + 1) * strideY;
+              for (let x = 0; x < 16; x++) ids[dst++] = localToGlobal[s.blocks[src++]];
+            }
+        }
+        return {
+          sizeX: 16, sizeY, sizeZ: 16, baseY,
+          ids, classes: Uint8Array.from(classes), colors: Uint32Array.from(colors),
+          strideZ, strideY,
+          idAt(x, y, z) { return this.ids[(x + 1) + (z + 1) * this.strideZ + (y + 1) * this.strideY]; },
+        };
+      }
+
+      const FACES = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+      const FACE_SHADE = [0.8, 0.8, 1.0, 0.5, 0.7, 0.6];
+
+      function faceVisible(hereClass, hereId, thereClass, thereId) {
+        if (thereClass === CLASS_EMPTY) return true;
+        if (thereClass === CLASS_OPAQUE) return false;
+        if (hereClass === CLASS_TRANSPARENT && hereId === thereId) return false;
+        return true;
+      }
+
+      // Greedy mesh → flat arrays. Returns {positions, normals, colors, indices}.
+      function greedyMesh(grid) {
+        const dims = [grid.sizeX, grid.sizeY, grid.sizeZ];
+        const positions = [], normals = [], colors = [], indices = [];
+        const maskSize = Math.max(dims[0]*dims[1], dims[1]*dims[2], dims[0]*dims[2]);
+        const mask = new Int32Array(maskSize);
+
+        for (let f = 0; f < 6; f++) {
+          const [dx, dy, dz] = FACES[f], shade = FACE_SHADE[f];
+          const axis = dx !== 0 ? 0 : dy !== 0 ? 1 : 2;
+          const u = (axis + 1) % 3, v = (axis + 2) % 3;
+          const dir = dx + dy + dz;
+          const sliceCount = dims[axis], uSize = dims[u], vSize = dims[v];
+          const coord = [0,0,0], ncoord = [0,0,0];
+
+          for (let slice = 0; slice < sliceCount; slice++) {
+            let m = 0;
+            for (let vv = 0; vv < vSize; vv++) {
+              for (let uu = 0; uu < uSize; uu++, m++) {
+                coord[axis] = slice; coord[u] = uu; coord[v] = vv;
+                const hereId = grid.idAt(coord[0], coord[1], coord[2]);
+                if (hereId === 0) { mask[m] = 0; continue; }
+                ncoord[0] = coord[0]+dx; ncoord[1] = coord[1]+dy; ncoord[2] = coord[2]+dz;
+                const thereId = grid.idAt(ncoord[0], ncoord[1], ncoord[2]);
+                mask[m] = faceVisible(grid.classes[hereId], hereId, grid.classes[thereId], thereId) ? hereId : 0;
+              }
+            }
+            for (let j = 0; j < vSize; j++) {
+              for (let i = 0; i < uSize; ) {
+                const start = j * uSize + i, id = mask[start];
+                if (id === 0) { i++; continue; }
+                let w = 1;
+                while (i + w < uSize && mask[start + w] === id) w++;
+                let h = 1;
+                grow: while (j + h < vSize) {
+                  const rowBase = (j + h) * uSize + i;
+                  for (let k = 0; k < w; k++) if (mask[rowBase + k] !== id) break grow;
+                  h++;
+                }
+                const base = [0,0,0]; base[axis] = slice + (dir > 0 ? 1 : 0); base[u] = i; base[v] = j;
+                const du = [0,0,0]; du[u] = w;
+                const dv = [0,0,0]; dv[v] = h;
+                emitQuad(positions, normals, colors, indices, grid.baseY, base, du, dv, dx, dy, dz, dir, grid.colors[id], shade);
+                for (let b = 0; b < h; b++) {
+                  const rowBase = (j + b) * uSize + i;
+                  for (let a = 0; a < w; a++) mask[rowBase + a] = 0;
+                }
+                i += w;
+              }
+            }
+          }
+        }
+        return {
+          positions: new Float32Array(positions),
+          normals: new Int8Array(normals),
+          colors: new Uint8Array(colors),
+          indices: new Uint32Array(indices),
+          quadCount: indices.length / 6,
+        };
+      }
+
+      function emitQuad(positions, normals, colors, indices, baseY, base, du, dv, nx, ny, nz, dir, color, shade) {
+        const startVertex = positions.length / 3;
+        const x0 = base[0], y0 = base[1] + baseY, z0 = base[2];
+        const corners = [
+          [x0, y0, z0],
+          [x0+du[0], y0+du[1], z0+du[2]],
+          [x0+du[0]+dv[0], y0+du[1]+dv[1], z0+du[2]+dv[2]],
+          [x0+dv[0], y0+dv[1], z0+dv[2]],
+        ];
+        const r = (color >> 16) & 0xff, g = (color >> 8) & 0xff, b = color & 0xff;
+        const a = Math.round(shade * 255);
+        for (const c of corners) {
+          positions.push(c[0], c[1], c[2]);
+          normals.push(nx, ny, nz);
+          colors.push(r, g, b, a);
+        }
+        if (dir > 0) {
+          indices.push(startVertex, startVertex+1, startVertex+2, startVertex, startVertex+2, startVertex+3);
+        } else {
+          indices.push(startVertex, startVertex+2, startVertex+1, startVertex, startVertex+3, startVertex+2);
+        }
+      }
+
+      // ============ Phase 4: WebGL renderer ============
+
+      // --- minimal column-major mat4 helpers ---
+      function mat4Identity() { const m = new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; return m; }
+      function mat4Perspective(fovy, aspect, near, far) {
+        const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+        const m = new Float32Array(16);
+        m[0] = f / aspect; m[5] = f; m[10] = (far + near) * nf; m[11] = -1;
+        m[14] = 2 * far * near * nf;
+        return m;
+      }
+      function mat4LookAt(eye, center, up) {
+        const z0 = eye[0]-center[0], z1 = eye[1]-center[1], z2 = eye[2]-center[2];
+        let zl = Math.hypot(z0, z1, z2) || 1;
+        const zx = z0/zl, zy = z1/zl, zz = z2/zl;
+        let xx = up[1]*zz - up[2]*zy, xy = up[2]*zx - up[0]*zz, xz = up[0]*zy - up[1]*zx;
+        let xl = Math.hypot(xx, xy, xz) || 1;
+        xx/=xl; xy/=xl; xz/=xl;
+        const yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+        const m = new Float32Array(16);
+        m[0]=xx; m[1]=yx; m[2]=zx; m[3]=0;
+        m[4]=xy; m[5]=yy; m[6]=zy; m[7]=0;
+        m[8]=xz; m[9]=yz; m[10]=zz; m[11]=0;
+        m[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+        m[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+        m[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+        m[15]=1;
+        return m;
+      }
+      function mat4Multiply(a, b) {
+        const o = new Float32Array(16);
+        for (let c = 0; c < 4; c++)
+          for (let r = 0; r < 4; r++)
+            o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+        return o;
+      }
+
+      const VERT_SRC = `
+        attribute vec3 aPos;
+        attribute vec3 aNormal;
+        attribute vec4 aColor;
+        uniform mat4 uViewProj;
+        varying vec4 vColor;
+        void main() {
+          // aColor.a carries baked face shading; fold it into rgb here.
+          vColor = vec4(aColor.rgb * aColor.a, 1.0);
+          gl_Position = uViewProj * vec4(aPos, 1.0);
+        }`;
+      const FRAG_SRC = `
+        precision mediump float;
+        varying vec4 vColor;
+        void main() { gl_FragColor = vColor; }`;
+
+      function compileShader(gl, type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+          throw new Error('shader compile: ' + gl.getShaderInfoLog(s));
+        }
+        return s;
+      }
+
+      const canvas = document.getElementById('gl');
+      const statusEl = document.getElementById('status');
+      const gl = canvas.getContext('webgl', { antialias: true });
+      if (!gl) statusEl.textContent = 'WebGL is not available in this browser.';
+
+      let program, locPos, locNormal, locColor, locViewProj;
+      if (gl) {
+        program = gl.createProgram();
+        gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERT_SRC));
+        gl.attachShader(program, compileShader(gl, gl.FRAGMENT_SHADER, FRAG_SRC));
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          throw new Error('program link: ' + gl.getProgramInfoLog(program));
+        }
+        locPos = gl.getAttribLocation(program, 'aPos');
+        locNormal = gl.getAttribLocation(program, 'aNormal');
+        locColor = gl.getAttribLocation(program, 'aColor');
+        locViewProj = gl.getUniformLocation(program, 'uViewProj');
+        gl.enable(gl.DEPTH_TEST);
+        gl.enable(gl.CULL_FACE);
+        gl.cullFace(gl.BACK);
+        gl.clearColor(0.05, 0.05, 0.07, 1);
+      }
+
+      // One GPU-resident chunk: its buffers plus an AABB for frustum culling.
+      // mesh fields: posBuf, normBuf, colBuf, idxBuf, count (indices), center, radius.
+      const chunkMeshes = [];
+
+      function uploadMesh(mesh, originX, originZ) {
+        const posBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+        // Bake world origin into positions so the shader needs no per-chunk model matrix.
+        const p = mesh.positions;
+        for (let i = 0; i < p.length; i += 3) { p[i] += originX; p[i+2] += originZ; }
+        gl.bufferData(gl.ARRAY_BUFFER, p, gl.STATIC_DRAW);
+
+        const normBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.STATIC_DRAW);
+
+        const colBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh.colors, gl.STATIC_DRAW);
+
+        const idxBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+
+        // Bounding sphere from the position extent.
+        let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+        for (let i = 0; i < p.length; i += 3) {
+          if (p[i]<minX)minX=p[i]; if (p[i]>maxX)maxX=p[i];
+          if (p[i+1]<minY)minY=p[i+1]; if (p[i+1]>maxY)maxY=p[i+1];
+          if (p[i+2]<minZ)minZ=p[i+2]; if (p[i+2]>maxZ)maxZ=p[i+2];
+        }
+        const center = [(minX+maxX)/2, (minY+maxY)/2, (minZ+maxZ)/2];
+        const radius = Math.hypot(maxX-center[0], maxY-center[1], maxZ-center[2]);
+        chunkMeshes.push({ posBuf, normBuf, colBuf, idxBuf, count: mesh.indices.length, center, radius });
+      }
+
+      function clearMeshes() {
+        for (const m of chunkMeshes) {
+          gl.deleteBuffer(m.posBuf); gl.deleteBuffer(m.normBuf);
+          gl.deleteBuffer(m.colBuf); gl.deleteBuffer(m.idxBuf);
+        }
+        chunkMeshes.length = 0;
+      }
+
+      // --- orbit camera ---
+      const cam = { target: [256, 64, 256], dist: 600, yaw: 0.7, pitch: 0.9 };
+
+      function cameraEye() {
+        const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+        const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+        return [
+          cam.target[0] + cam.dist * cp * sy,
+          cam.target[1] + cam.dist * sp,
+          cam.target[2] + cam.dist * cp * cy,
+        ];
+      }
+
+      // Extract the 6 frustum planes from a view-projection matrix (Gribb-Hartmann).
+      function extractFrustum(m) {
+        const planes = [];
+        const add = (a,b,c,d) => {
+          const len = Math.hypot(a,b,c) || 1;
+          planes.push([a/len, b/len, c/len, d/len]);
+        };
+        add(m[3]+m[0], m[7]+m[4], m[11]+m[8], m[15]+m[12]); // left
+        add(m[3]-m[0], m[7]-m[4], m[11]-m[8], m[15]-m[12]); // right
+        add(m[3]+m[1], m[7]+m[5], m[11]+m[9], m[15]+m[13]); // bottom
+        add(m[3]-m[1], m[7]-m[5], m[11]-m[9], m[15]-m[13]); // top
+        add(m[3]+m[2], m[7]+m[6], m[11]+m[10], m[15]+m[14]); // near
+        add(m[3]-m[2], m[7]-m[6], m[11]-m[10], m[15]-m[14]); // far
+        return planes;
+      }
+
+      function sphereInFrustum(planes, c, r) {
+        for (const p of planes) {
+          if (p[0]*c[0] + p[1]*c[1] + p[2]*c[2] + p[3] < -r) return false;
+        }
+        return true;
+      }
+
+      function resize() {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+        if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+      }
+
+      let drawnLast = 0;
+      function render() {
+        if (!gl) return;
+        resize();
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        if (chunkMeshes.length === 0) { requestAnimationFrame(render); return; }
+
+        const aspect = canvas.width / canvas.height || 1;
+        const proj = mat4Perspective(Math.PI / 3, aspect, 1, 6000);
+        const view = mat4LookAt(cameraEye(), cam.target, [0, 1, 0]);
+        const viewProj = mat4Multiply(proj, view);
+        const frustum = extractFrustum(viewProj);
+
+        gl.useProgram(program);
+        gl.uniformMatrix4fv(locViewProj, false, viewProj);
+
+        let drawn = 0;
+        for (const m of chunkMeshes) {
+          if (!sphereInFrustum(frustum, m.center, m.radius)) continue; // frustum culling
+          gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
+          gl.enableVertexAttribArray(locPos);
+          gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, 0, 0);
+          gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf);
+          gl.enableVertexAttribArray(locNormal);
+          gl.vertexAttribPointer(locNormal, 3, gl.BYTE, false, 0, 0);
+          gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf);
+          gl.enableVertexAttribArray(locColor);
+          gl.vertexAttribPointer(locColor, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf);
+          gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+          drawn++;
+        }
+        drawnLast = drawn;
+        requestAnimationFrame(render);
+      }
+
+      // UNSIGNED_INT indices need OES_element_index_uint on WebGL1.
+      if (gl) {
+        if (!gl.getExtension('OES_element_index_uint')) {
+          statusEl.textContent = 'This browser lacks 32-bit index support; large chunks may not render.';
+        }
+        requestAnimationFrame(render);
+      }
+
+      // ============ load + mesh a region ============
+
+      let loadToken = 0;
+      async function loadRegion(file) {
+        const token = ++loadToken;
+        clearMeshes();
+        const region = await openRegion(file);
+        const coords = [];
+        for (let i = 0; i < 1024; i++) if (region.locations[i] !== 0) coords.push(i);
+        const total = coords.length;
+        let done = 0, failed = 0, quads = 0;
+        let sumX = 0, sumZ = 0, n = 0;
+
+        const t0 = performance.now();
+        const CONCURRENCY = Math.min(16, Math.max(4, (navigator.hardwareConcurrency || 8)));
+        let next = 0;
+        const lanes = Array.from({ length: Math.min(CONCURRENCY, total) }, async () => {
+          while (next < coords.length && token === loadToken) {
+            const c = coords[next++];
+            const cx = c & 31, cz = c >>> 5;
+            try {
+              const nbt = await readChunkNbt(region, cx, cz);
+              if (token !== loadToken) return;
+              const chunk = parseChunk(nbt);
+              const grid = buildGrid(chunk);
+              if (grid) {
+                const mesh = greedyMesh(grid);
+                if (mesh.quadCount > 0) {
+                  const ox = cx * 16, oz = cz * 16;
+                  uploadMesh(mesh, ox, oz);
+                  quads += mesh.quadCount;
+                  sumX += ox + 8; sumZ += oz + 8; n++;
+                }
+              }
+            } catch (err) {
+              failed++;
+            }
+            done++;
+          }
+        });
+
+        const progress = setInterval(() => {
+          if (token === loadToken) statusEl.textContent = `Meshing… ${done}/${total} chunks`;
+        }, 100);
+        try { await Promise.all(lanes); } finally { clearInterval(progress); }
+        if (token !== loadToken) return;
+
+        if (n > 0) { cam.target[0] = sumX / n; cam.target[2] = sumZ / n; cam.dist = 700; }
+        const secs = ((performance.now() - t0) / 1000).toFixed(2);
+        statusEl.textContent =
+          `${file.name}: ${total} chunks, ${quads.toLocaleString()} quads in ${secs} s` +
+          (failed ? ` (${failed} unreadable)` : '') + '. Drag to orbit.';
+      }
+
+      document.getElementById('file').addEventListener('change', async (ev) => {
+        const file = ev.target.files && ev.target.files[0];
+        if (!file) return;
+        try { await loadRegion(file); }
+        catch (err) { statusEl.textContent = `Failed to load ${file.name}: ${err.message || err}`; }
+      });
+
+      // ============ camera controls ============
+
+      let dragging = false, panning = false, lastX = 0, lastY = 0;
+      canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+      canvas.addEventListener('pointerdown', (ev) => {
+        dragging = ev.button === 0;
+        panning = ev.button === 2;
+        lastX = ev.clientX; lastY = ev.clientY;
+        canvas.setPointerCapture(ev.pointerId);
+      });
+      canvas.addEventListener('pointermove', (ev) => {
+        if (!dragging && !panning) return;
+        const dx = ev.clientX - lastX, dy = ev.clientY - lastY;
+        lastX = ev.clientX; lastY = ev.clientY;
+        if (dragging) {
+          cam.yaw -= dx * 0.005;
+          cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy * 0.005));
+        } else {
+          // Pan across the ground plane, scaled by distance.
+          const s = cam.dist * 0.0015;
+          const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+          cam.target[0] -= (dx * cy - dy * sy) * s;
+          cam.target[2] += (dx * sy + dy * cy) * s;
+        }
+      });
+      canvas.addEventListener('pointerup', () => { dragging = panning = false; });
+      canvas.addEventListener('wheel', (ev) => {
+        ev.preventDefault();
+        cam.dist = Math.max(20, Math.min(4000, cam.dist * Math.pow(1.1, ev.deltaY / 100)));
+      }, { passive: false });
+
+      const keys = new Set();
+      window.addEventListener('keydown', (e) => {
+        const k = e.key.toLowerCase();
+        if (k === 'r') { cam.yaw = 0.7; cam.pitch = 0.9; cam.dist = 700; }
+        keys.add(k);
+      });
+      window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+      // WASD pan, integrated each frame.
+      setInterval(() => {
+        if (keys.size === 0) return;
+        const s = cam.dist * 0.01;
+        const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+        if (keys.has('w')) { cam.target[0] -= sy * s; cam.target[2] -= cy * s; }
+        if (keys.has('s')) { cam.target[0] += sy * s; cam.target[2] += cy * s; }
+        if (keys.has('a')) { cam.target[0] -= cy * s; cam.target[2] += sy * s; }
+        if (keys.has('d')) { cam.target[0] += cy * s; cam.target[2] -= sy * s; }
+      }, 16);
+    </script>
+  </body>
+</html>

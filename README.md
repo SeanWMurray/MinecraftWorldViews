@@ -12,13 +12,14 @@ draw calls.
 | ----- | ----- | ------ |
 | 1. I/O & decompression | Stream `.mca` region files, ranged reads, native `DecompressionStream`, worker pool | ya |
 | 2. NBT & blockstates | Lazy NBT parser, bit-packed palette extraction | kinda |
-| 3. Geometry & meshing | Greedy meshing + culling (Wasm) | not yet |
-| 4. WebGL rendering | Texture atlas, frustum culling, direct buffer upload | not yet|
+| 3. Geometry & meshing | Greedy meshing + internal-face & transparency culling | ya |
+| 4. WebGL rendering | Per-chunk static buffers, frustum culling, orbit camera | kinda |
 
 ## Architecture
 
 ```
-index.html                 Region inspector — just open it in a browser
+index.html                 2D region inspector — just open it in a browser
+viewer.html                3D region viewer (WebGL) — open it in a browser
 src/
   index.ts                 Public API
   io/
@@ -35,6 +36,14 @@ src/
     chunk.ts               Lazy chunk parser — reads only sections/palettes/
                            blockstates, ignores entities, lighting, ticks
     bit-packing.ts         1.16+ packed-index unpacking via 32-bit halves
+  mesh/
+    block-model.ts         Per-palette block classification (empty/opaque/
+                           transparent) + block colors
+    voxel-grid.ts          Flattens a chunk's sections into one padded id grid
+                           so the mesher reads neighbours with no bounds checks
+    greedy-mesher.ts       Greedy meshing: merges coplanar same-block faces
+                           into maximal quads, culls hidden internal faces,
+                           emits flat Float32/Int8/Uint8/Uint32 arrays
   worker/
     pool.ts                Generic Web Worker pool (transfer-based, FIFO queue)
     region-worker.ts       Off-thread chunk decompression + parsing
@@ -56,6 +65,16 @@ test/                      Vitest suite with synthetic region files & NBT
 - **Off-thread everything.** `createRegionWorkerPool()` decompresses *and* parses in workers;
   payloads move via transfer lists (never structured-clone copies) and section arrays are
   transferred back.
+- **Greedy meshing, pure JS.** Each chunk's sections flatten into one padded `Uint16Array`
+  of block ids; the mesher sweeps the six face directions, builds a per-slice mask, and
+  merges adjacent same-block coplanar faces into maximal quads. Internal faces and faces
+  hidden by opaque neighbours are culled; same-material transparent faces are culled too,
+  so a block of glass doesn't z-fight with itself. Output is exactly-sized flat typed
+  arrays (`Float32Array` positions, `Int8Array` normals, `Uint8Array` RGBA, `Uint32Array`
+  indices) — upload-ready with no further JS. No Wasm, so it still runs straight from disk.
+- **Frustum-culled draw.** Each chunk uploads to its own static WebGL buffers once; a
+  per-frame bounding-sphere test against the view-frustum planes skips off-screen chunks.
+  Face shading is baked into vertex alpha, so the fragment shader does no lighting.
 
 ## Usage
 
@@ -79,17 +98,38 @@ for (const { x, z } of region.chunks()) {
 Supports worlds from Minecraft 1.16 onwards (1.18+ `sections` layout and the older
 `Level.Sections` layout).
 
+To turn a parsed chunk into WebGL-ready geometry, hand it to `meshChunk`:
+
+```ts
+import { meshChunk } from 'minecraft-world-views';
+
+const mesh = meshChunk(chunk); // null if the chunk has no renderable blocks
+if (mesh) {
+  // mesh.positions: Float32Array  (x,y,z per vertex; add chunk.x*16 / chunk.z*16)
+  // mesh.normals:   Int8Array     (axis-aligned face normal per vertex)
+  // mesh.colors:    Uint8Array    (r,g,b,a; alpha is baked face shading)
+  // mesh.indices:   Uint32Array   (two triangles per quad)
+  gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
+}
+```
+
 ## Running it
 
-Download or clone the repo and open `index.html` in a browser. That's it — no install,
-no build, no server. Pick an `.mca` file and it renders a top-down terrain map of the
-region, one pixel per block, with map-style hillshading. Scroll to zoom (anchored at the
-cursor), drag to pan, double-click to reset the view, and click anywhere to identify the
-surface block and its height.
+Download or clone the repo and open one of the two pages in a browser. No install,
+no build, no server.
 
-(`index.html` inlines the Phase 1 pipeline as a classic script because browsers block
-ES module imports and Web Workers on pages opened from disk. The importable library
-in `src/` is the same logic, plus the worker pool for embedding in real apps.)
+- **`index.html` — 2D map.** Pick an `.mca` file and it renders a top-down terrain map
+  of the region, one pixel per block, with map-style hillshading. Scroll to zoom (anchored
+  at the cursor), drag to pan, double-click to reset, and click anywhere to identify the
+  surface block and its height.
+- **`viewer.html` — 3D view.** Pick an `.mca` file and it greedy-meshes every chunk and
+  renders the region in WebGL. Drag to orbit, scroll to zoom, right-drag or WASD to pan,
+  and press R to reset the camera.
+
+(Both pages inline the Phase 1-3 pipeline as a classic script because browsers block ES
+module imports and Web Workers on pages opened from disk. WebGL itself has no such
+restriction. The importable library in `src/` is the same logic, plus the worker pool,
+for embedding in real apps.)
 
 ## Development
 
