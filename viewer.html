@@ -91,6 +91,25 @@
         return format === null ? payload : await inflate(payload, format);
       }
 
+      // Like readChunkNbt but returns the still-compressed payload + format, so the
+      // decompression can be offloaded to a worker. Returns a COPY of the payload
+      // (a fresh Uint8Array) so its buffer can be transferred to the worker without
+      // detaching the region's sector read.
+      async function readChunkRaw(region, x, z) {
+        const entry = region.locations[chunkIndex(x, z)];
+        if (entry === 0) return null;
+        const sectorOffset = entry >>> 8, sectorCount = entry & 0xff;
+        if (sectorOffset < 2 || sectorCount === 0) throw new Error(`corrupt location (${x},${z})`);
+        const data = await readRange(region.file, sectorOffset * SECTOR_SIZE, sectorCount * SECTOR_SIZE);
+        if (data.byteLength < 5) throw new Error(`truncated chunk (${x},${z})`);
+        const length = new DataView(data.buffer).getUint32(0);
+        if (length < 1 || 4 + length > data.byteLength) throw new Error(`corrupt chunk (${x},${z})`);
+        const type = data[4];
+        if ((type & 0x80) !== 0) throw new Error(`chunk (${x},${z}) is external (.mcc)`);
+        const format = compressionFormat(type);
+        return { payload: data.slice(5, 4 + length), format };
+      }
+
       // ============ Minimal ZIP reader (for resource packs / .jar) ============
       //
       // Resource packs are ZIP archives. We only need to pull a handful of PNG
@@ -1290,6 +1309,315 @@
         catch (err) { statusEl.textContent = `Failed to read pack ${file.name}: ${err.message || err}`; }
       });
 
+      // ============ worker pool (phase 2) ============
+      //
+      // The heavy CPU work (decompress → parse → build grid → greedy mesh) is
+      // pure and self-contained, so we run it in a pool of Web Workers spawned
+      // from a Blob URL (the one worker form that works from file://). The worker
+      // source is assembled from the SAME functions this page already defines —
+      // stringified via Function.toString — so there's no second copy to drift.
+      //
+      // Texture layers stay single-threaded: the worker emits per-vertex layers as
+      // CHUNK-LOCAL indices into the chunk's own name list, and the main thread
+      // remaps those to the shared global atlas layers on receipt.
+
+      function buildWorkerSource() {
+        // Constants and pure helpers the pipeline needs, by reference.
+        const parts = [
+          'const TAG_END=0,TAG_BYTE=1,TAG_SHORT=2,TAG_INT=3,TAG_LONG=4,TAG_FLOAT=5,'+
+          'TAG_DOUBLE=6,TAG_BYTE_ARRAY=7,TAG_STRING=8,TAG_LIST=9,TAG_COMPOUND=10,'+
+          'TAG_INT_ARRAY=11,TAG_LONG_ARRAY=12;',
+          'const CLASS_EMPTY=0,CLASS_OPAQUE=1,CLASS_TRANSPARENT=2,CLASS_CROSS=3,CLASS_FLUID=4;',
+          'const AIR=' + setLiteral(AIR) + ';',
+          'const TRANSPARENT=' + setLiteral(TRANSPARENT) + ';',
+          'const TRANSPARENT_SUFFIX=' + JSON.stringify(TRANSPARENT_SUFFIX) + ';',
+          'const FLUID=' + setLiteral(FLUID) + ';',
+          'const CROSS=' + setLiteral(CROSS) + ';',
+          'const CROSS_SUFFIX=' + JSON.stringify(CROSS_SUFFIX) + ';',
+          'const NON_SOLID=' + setLiteral(NON_SOLID) + ';',
+          'const NON_SOLID_SUFFIX=' + JSON.stringify(NON_SOLID_SUFFIX) + ';',
+          'const BLOCK_COLORS=' + JSON.stringify(BLOCK_COLORS) + ';',
+          'const TINTED=' + setLiteral(TINTED) + ';',
+          'const TINTED_SUFFIX=' + JSON.stringify(TINTED_SUFFIX) + ';',
+          'const HASH_COLORS=new Map();',
+          // Pure functions, verbatim from this page. Arrow-assigned consts (u8,
+          // i8, …) stringify WITHOUT their `const name =` binding, so we re-bind
+          // every function by name; `function foo(){}` declarations already carry
+          // their name, so prefixing `const foo =` to them also works.
+          ...[
+            nbtReader, u8, i8, u16, i32, readStr, skipStr, skipValue,
+            bitsForPalette, unpackPackedInts, readPalette, readSection,
+            readChunkCompound, parseChunk,
+            classifyName, colorForName, tintForName,
+            buildGridWorker, faceVisible, emitQuad, emitCross, greedyMeshWorker,
+            compressionFormat, inflate, meshNbtInWorker,
+          ].map((fn) => `const ${fn.name} = ${fn.toString()};`),
+        ];
+        parts.push(`onmessage=async(e)=>{
+          const {id,payload,format}=e.data;
+          try{
+            const nbt=format===null?payload:await inflate(payload,format);
+            const res=await meshNbtInWorker(nbt);
+            if(!res){postMessage({id,empty:true});return;}
+            const t=[res.mesh.positions.buffer,res.mesh.normals.buffer,res.mesh.colors.buffer,
+              res.mesh.uvs.buffer,res.mesh.layers.buffer,res.mesh.tints.buffer,
+              res.mesh.indices.buffer,res.ids.buffer];
+            postMessage({id,res},t);
+          }catch(err){postMessage({id,error:String(err&&err.message||err)});}
+        };`);
+        return parts.join('\n');
+      }
+      function setLiteral(s) { return 'new Set(' + JSON.stringify([...s]) + ')'; }
+
+      // Worker-side buildGrid: identical to buildGrid but assigns CHUNK-LOCAL
+      // texture layers (0..N over this chunk's distinct textured names) and returns
+      // the name list so the main thread can remap to global atlas layers.
+      function buildGridWorker(chunk) {
+        const sections = chunk.sections;
+        if (sections.length === 0) return null;
+        const minY = sections[0].y, maxY = sections[sections.length - 1].y;
+        const sizeY = (maxY - minY + 1) * 16;
+        const baseY = minY * 16;
+        const idByName = new Map([['', 0]]);
+        const names = [''];
+        const classes = [CLASS_EMPTY];
+        const colors = [0];
+        const localLayers = [-1];   // chunk-local layer per id (-1 = empty)
+        const layerNames = [];      // local layer index → block name
+        const tints = [0];
+        const strideZ = 18, strideY = 18 * 18;
+        const ids = new Uint16Array(strideY * (sizeY + 2));
+        for (const s of sections) {
+          const localToGlobal = new Uint16Array(s.palette.length);
+          for (let p = 0; p < s.palette.length; p++) {
+            const cls = classifyName(s.palette[p]);
+            if (cls === CLASS_EMPTY) { localToGlobal[p] = 0; continue; }
+            const name = s.palette[p];
+            let gid = idByName.get(name);
+            if (gid === undefined) {
+              gid = classes.length;
+              idByName.set(name, gid);
+              names.push(name);
+              classes.push(cls);
+              colors.push(colorForName(name));
+              localLayers.push(layerNames.length); // chunk-local layer
+              layerNames.push(name);
+              tints.push(tintForName(name));
+            }
+            localToGlobal[p] = gid;
+          }
+          const yOff = (s.y - minY) * 16;
+          if (s.blocks === null) {
+            const gid = localToGlobal[0];
+            if (gid === 0) continue;
+            for (let y = 0; y < 16; y++)
+              for (let z = 0; z < 16; z++) {
+                let o = 1 + (z + 1) * strideZ + (yOff + y + 1) * strideY;
+                for (let x = 0; x < 16; x++) ids[o++] = gid;
+              }
+            continue;
+          }
+          for (let y = 0; y < 16; y++)
+            for (let z = 0; z < 16; z++) {
+              let src = (((y << 4) | z) << 4);
+              let dst = 1 + (z + 1) * strideZ + (yOff + y + 1) * strideY;
+              for (let x = 0; x < 16; x++) ids[dst++] = localToGlobal[s.blocks[src++]];
+            }
+        }
+        return {
+          sizeX: 16, sizeY, sizeZ: 16, baseY, names, layerNames,
+          ids, classes, colors, layers: localLayers, tints, strideZ, strideY,
+          idAt(x, y, z) { return this.ids[(x + 1) + (z + 1) * this.strideZ + (y + 1) * this.strideY]; },
+        };
+      }
+
+      // Worker-side greedyMesh: same algorithm, returns plain JS arrays converted
+      // to typed arrays. (Identical body to greedyMesh; kept separate so the main
+      // thread's version can keep using global layers for the fallback path.)
+      function greedyMeshWorker(grid) {
+        const dims = [grid.sizeX, grid.sizeY, grid.sizeZ];
+        const positions = [], normals = [], colors = [], uvs = [], texLayers = [], tints = [], indices = [];
+        const maskSize = Math.max(dims[0]*dims[1], dims[1]*dims[2], dims[0]*dims[2]);
+        const mask = new Int32Array(maskSize);
+        const FACES = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+        const FACE_SHADE = [0.8, 0.8, 1.0, 0.5, 0.7, 0.6];
+        for (let f = 0; f < 6; f++) {
+          const [dx, dy, dz] = FACES[f], shade = FACE_SHADE[f];
+          const axis = dx !== 0 ? 0 : dy !== 0 ? 1 : 2;
+          const u = (axis + 1) % 3, v = (axis + 2) % 3;
+          const dir = dx + dy + dz;
+          const sliceCount = dims[axis], uSize = dims[u], vSize = dims[v];
+          const coord = [0,0,0], ncoord = [0,0,0];
+          for (let slice = 0; slice < sliceCount; slice++) {
+            let m = 0;
+            for (let vv = 0; vv < vSize; vv++) {
+              for (let uu = 0; uu < uSize; uu++, m++) {
+                coord[axis] = slice; coord[u] = uu; coord[v] = vv;
+                const hereId = grid.idAt(coord[0], coord[1], coord[2]);
+                const hereClass = hereId === 0 ? 0 : grid.classes[hereId];
+                if (hereId === 0 || hereClass === CLASS_CROSS) { mask[m] = 0; continue; }
+                if (hereClass === CLASS_FLUID && f !== 2) { mask[m] = 0; continue; }
+                ncoord[0] = coord[0]+dx; ncoord[1] = coord[1]+dy; ncoord[2] = coord[2]+dz;
+                const thereId = grid.idAt(ncoord[0], ncoord[1], ncoord[2]);
+                mask[m] = faceVisible(hereClass, hereId, grid.classes[thereId], thereId) ? hereId : 0;
+              }
+            }
+            for (let j = 0; j < vSize; j++) {
+              for (let i = 0; i < uSize; ) {
+                const start = j * uSize + i, id = mask[start];
+                if (id === 0) { i++; continue; }
+                let w = 1;
+                while (i + w < uSize && mask[start + w] === id) w++;
+                let h = 1;
+                grow: while (j + h < vSize) {
+                  const rowBase = (j + h) * uSize + i;
+                  for (let k = 0; k < w; k++) if (mask[rowBase + k] !== id) break grow;
+                  h++;
+                }
+                const base = [0,0,0]; base[axis] = slice + (dir > 0 ? 1 : 0); base[u] = i; base[v] = j;
+                const du = [0,0,0]; du[u] = w;
+                const dv = [0,0,0]; dv[v] = h;
+                emitQuad(positions, normals, colors, uvs, texLayers, tints, indices,
+                  grid.baseY, base, du, dv, dx, dy, dz, dir,
+                  grid.colors[id], shade, w, h, grid.layers[id], grid.tints[id], axis, u, v);
+                for (let b = 0; b < h; b++) {
+                  const rowBase = (j + b) * uSize + i;
+                  for (let a = 0; a < w; a++) mask[rowBase + a] = 0;
+                }
+                i += w;
+              }
+            }
+          }
+        }
+        for (let y = 0; y < grid.sizeY; y++)
+          for (let z = 0; z < grid.sizeZ; z++)
+            for (let x = 0; x < grid.sizeX; x++) {
+              const id = grid.idAt(x, y, z);
+              if (id === 0 || grid.classes[id] !== CLASS_CROSS) continue;
+              emitCross(positions, normals, colors, uvs, texLayers, tints, indices,
+                grid.baseY, x, y, z, grid.colors[id], grid.layers[id], grid.tints[id]);
+            }
+        return {
+          positions: new Float32Array(positions),
+          normals: new Int8Array(normals),
+          colors: new Uint8Array(colors),
+          uvs: new Float32Array(uvs),
+          layers: new Float32Array(texLayers),
+          tints: new Float32Array(tints),
+          indices: new Uint32Array(indices),
+          quadCount: indices.length / 6,
+        };
+      }
+
+      // Worker entry: decompress NBT bytes → parse → grid → mesh. Returns the mesh
+      // (with chunk-local layers), the chunk's layer-name list (for remap), and the
+      // grid ids + names + baseY for click-to-identify retention.
+      async function meshNbtInWorker(nbt) {
+        const chunk = parseChunk(nbt);
+        const grid = buildGridWorker(chunk);
+        if (!grid) return null;
+        const mesh = greedyMeshWorker(grid);
+        if (mesh.quadCount === 0) return null;
+        return {
+          mesh, layerNames: grid.layerNames, names: grid.names,
+          ids: grid.ids, baseY: grid.baseY, sizeY: grid.sizeY,
+        };
+      }
+
+      // Lazily-built worker pool + a one-time feature test that a Blob worker can
+      // run DecompressionStream and round-trip bytes from this file:// page.
+      let workerPool = null;       // { workers, free, jobs } or 'unsupported'
+      async function getWorkerPool() {
+        if (workerPool) return workerPool === 'unsupported' ? null : workerPool;
+        try {
+          const src = buildWorkerSource();
+          const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+          // Probe one worker with a tiny gzip round-trip before committing.
+          // Probe payload: a real gzip stream so the test exercises the worker's
+          // DecompressionStream (the API most likely to be missing/blocked), not
+          // just code loading. The decompressed bytes won't parse as a chunk, but
+          // any reply (even an error from parse) proves decompress + worker ran.
+          const gzData = new Uint8Array(await new Response(
+            new Blob([new Uint8Array([1,2,3,4])]).stream().pipeThrough(new CompressionStream('gzip'))
+          ).arrayBuffer());
+          const probe = new Worker(url);
+          const ok = await new Promise((resolve) => {
+            const timer = setTimeout(() => resolve(false), 3000);
+            probe.onmessage = (e) => { clearTimeout(timer); resolve(!!(e.data && e.data.id === -1)); };
+            probe.onerror = () => { clearTimeout(timer); resolve(false); };
+            probe.postMessage({ id: -1, payload: gzData, format: 'gzip' }, [gzData.buffer]);
+          });
+          probe.terminate();
+          if (!ok) { workerPool = 'unsupported'; URL.revokeObjectURL(url); return null; }
+          const count = Math.min(16, Math.max(2, (navigator.hardwareConcurrency || 8)));
+          const workers = Array.from({ length: count }, () => new Worker(url));
+          workerPool = { workers, free: [...workers], queue: [], jobs: new Map(), nextId: 1 };
+          for (const w of workers) {
+            w.onmessage = (e) => {
+              const job = workerPool.jobs.get(e.data.id);
+              if (job) { workerPool.jobs.delete(e.data.id); job(e.data); }
+              workerPool.free.push(w);
+              pumpQueue();
+            };
+          }
+          return workerPool;
+        } catch { workerPool = 'unsupported'; return null; }
+      }
+      function pumpQueue() {
+        const p = workerPool;
+        while (p.free.length && p.queue.length) {
+          const w = p.free.pop();
+          const { payload, format, resolve } = p.queue.shift();
+          const id = p.nextId++;
+          p.jobs.set(id, resolve);
+          w.postMessage({ id, payload, format }, [payload.buffer]);
+        }
+      }
+      function meshOnWorker(payload, format) {
+        return new Promise((resolve) => { workerPool.queue.push({ payload, format, resolve }); pumpQueue(); });
+      }
+
+      // Remap a worker mesh's chunk-local texture layers to global atlas layers in
+      // place. layerNames maps local index → block name; layerForName assigns (or
+      // looks up) the global layer. Done once per distinct local layer, then the
+      // per-vertex array is rewritten in one pass.
+      function remapWorkerLayers(layers, layerNames) {
+        const map = layerNames.map((nm) => layerForName(nm)); // local → global
+        for (let i = 0; i < layers.length; i++) {
+          const l = layers[i];
+          layers[i] = (l >= 0 && l < map.length) ? map[l] : -1;
+        }
+      }
+
+      // Upload a worker-produced mesh (already-typed arrays) to a VAO. Mirrors
+      // uploadMesh but takes the mesh object directly (positions already baked?
+      // no — origin still baked here, same as uploadMesh).
+      function uploadWorkerMesh(mesh, originX, originZ) {
+        const p = mesh.positions;
+        for (let i = 0; i < p.length; i += 3) { p[i] += originX; p[i+2] += originZ; }
+        const vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
+        const buffers = [
+          makeBuffer(gl.ARRAY_BUFFER, p, locPos, 3, gl.FLOAT, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.normals, locNormal, 3, gl.BYTE, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.colors, locColor, 4, gl.UNSIGNED_BYTE, true),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.uvs, locUV, 2, gl.FLOAT, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.layers, locLayer, 1, gl.FLOAT, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.tints, locTint, 1, gl.FLOAT, false),
+          makeBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, -1, 0, 0, false),
+        ];
+        gl.bindVertexArray(null);
+        let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+        for (let i = 0; i < p.length; i += 3) {
+          if (p[i]<minX)minX=p[i]; if (p[i]>maxX)maxX=p[i];
+          if (p[i+1]<minY)minY=p[i+1]; if (p[i+1]>maxY)maxY=p[i+1];
+          if (p[i+2]<minZ)minZ=p[i+2]; if (p[i+2]>maxZ)maxZ=p[i+2];
+        }
+        const center = [(minX+maxX)/2, (minY+maxY)/2, (minZ+maxZ)/2];
+        const radius = Math.hypot(maxX-center[0], maxY-center[1], maxZ-center[2]);
+        chunkMeshes.push({ vao, buffers, count: mesh.indices.length, center, radius });
+      }
+
       // ============ load + mesh a region ============
 
       let loadToken = 0;
@@ -1311,31 +1639,88 @@
         const t0 = performance.now();
         const CONCURRENCY = Math.min(16, Math.max(4, (navigator.hardwareConcurrency || 8)));
         let next = 0;
-        const lanes = Array.from({ length: Math.min(CONCURRENCY, total) }, async () => {
-          while (next < coords.length && token === loadToken) {
-            const c = coords[next++];
-            const cx = c & 31, cz = c >>> 5;
-            try {
-              const nbt = await readChunkNbt(region, cx, cz);
-              if (token !== loadToken) return;
-              const chunk = parseChunk(nbt);
-              const grid = buildGrid(chunk);
-              if (grid) {
-                const mesh = greedyMesh(grid);
-                if (mesh.quadCount > 0) {
-                  const ox = cx * 16, oz = cz * 16;
-                  pickGrids.set(cx + ',' + cz, grid); // ref only; read on click
-                  uploadMesh(mesh, ox, oz);
-                  quads += mesh.quadCount;
+
+        // Try to bring up the worker pool. If Blob workers / DecompressionStream
+        // aren't usable from this file:// page, pool is null and we fall back to
+        // the time-sliced main-thread path below.
+        const pool = await getWorkerPool();
+        if (token !== loadToken) return;
+
+        let lanes;
+        if (pool) {
+          // Worker path: main thread only does the ranged read + transfers the
+          // compressed payload; the worker decompresses, parses, builds, meshes,
+          // and transfers flat arrays back. Main thread remaps chunk-local texture
+          // layers → global atlas layers, retains pick data, and uploads to GL.
+          lanes = Array.from({ length: CONCURRENCY }, async () => {
+            while (next < coords.length && token === loadToken) {
+              const c = coords[next++];
+              const cx = c & 31, cz = c >>> 5;
+              try {
+                const raw = await readChunkRaw(region, cx, cz);
+                if (token !== loadToken) return;
+                if (!raw) { done++; continue; }
+                const reply = await meshOnWorker(raw.payload, raw.format);
+                if (token !== loadToken) return;
+                if (reply.error) { failed++; }
+                else if (reply.res) {
+                  const r = reply.res, ox = cx * 16, oz = cz * 16;
+                  remapWorkerLayers(r.mesh.layers, r.layerNames); // local → global
+                  uploadWorkerMesh(r.mesh, ox, oz);
+                  // Retain a lean grid for click-to-identify.
+                  pickGrids.set(cx + ',' + cz, {
+                    sizeY: r.sizeY, baseY: r.baseY, names: r.names, ids: r.ids,
+                    strideZ: 18, strideY: 324,
+                    idAt(x, y, z) { return this.ids[(x+1) + (z+1)*this.strideZ + (y+1)*this.strideY]; },
+                  });
+                  quads += r.mesh.quadCount;
                   sumX += ox + 8; sumZ += oz + 8; n++;
                 }
-              }
-            } catch (err) {
-              failed++;
+              } catch (err) { failed++; }
+              done++;
             }
-            done++;
-          }
-        });
+          });
+        } else {
+          // Fallback: time-sliced main-thread pipeline (phase 1). Bounds each CPU
+          // burst to a frame budget and yields so the UI stays responsive.
+          let sliceStart = performance.now();
+          const FRAME_BUDGET = 12;
+          const yieldToBrowser = () => new Promise((r) => {
+            const ch = new MessageChannel();
+            ch.port1.onmessage = () => r();
+            ch.port2.postMessage(0);
+          });
+          const maybeYield = async () => {
+            if (performance.now() - sliceStart >= FRAME_BUDGET) {
+              await yieldToBrowser();
+              sliceStart = performance.now();
+            }
+          };
+          lanes = Array.from({ length: Math.min(CONCURRENCY, total) }, async () => {
+            while (next < coords.length && token === loadToken) {
+              const c = coords[next++];
+              const cx = c & 31, cz = c >>> 5;
+              try {
+                const nbt = await readChunkNbt(region, cx, cz);
+                if (token !== loadToken) return;
+                const chunk = parseChunk(nbt);
+                const grid = buildGrid(chunk);
+                if (grid) {
+                  const mesh = greedyMesh(grid);
+                  if (mesh.quadCount > 0) {
+                    const ox = cx * 16, oz = cz * 16;
+                    pickGrids.set(cx + ',' + cz, grid);
+                    uploadMesh(mesh, ox, oz);
+                    quads += mesh.quadCount;
+                    sumX += ox + 8; sumZ += oz + 8; n++;
+                  }
+                }
+              } catch (err) { failed++; }
+              done++;
+              await maybeYield();
+            }
+          });
+        }
 
         const progress = setInterval(() => {
           if (token === loadToken) statusEl.textContent = `Meshing… ${done}/${total} chunks`;
