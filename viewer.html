@@ -22,11 +22,12 @@
     <div id="bar">
       <span>3D viewer —</span>
       <input id="file" type="file" accept=".mca,.mcr" />
+      <label>textures: <input id="pack" type="file" accept=".zip,.jar" /></label>
       <span id="status">Pick an <code>.mca</code> file from your world's <code>region/</code> folder.</span>
       <span style="margin-left:auto"><a href="index.html">2D map →</a></span>
     </div>
     <canvas id="gl"></canvas>
-    <div id="hint">drag to orbit · scroll to zoom · right-drag or WASD to pan · R to reset</div>
+    <div id="hint">drag to orbit · scroll to zoom · right-drag or WASD to pan · R to reset · load a resource pack for textures</div>
 
     <!--
       Self-contained 3D region viewer. Runs straight from disk (file://): WebGL
@@ -84,6 +85,68 @@
         const payload = data.subarray(5, 4 + length);
         const format = compressionFormat(type);
         return format === null ? payload : await inflate(payload, format);
+      }
+
+      // ============ Minimal ZIP reader (for resource packs / .jar) ============
+      //
+      // Resource packs are ZIP archives. We only need to pull a handful of PNG
+      // entries by name, so rather than inflate the whole archive we read the
+      // central directory at the end of the file, index entries by name, and
+      // decompress just the ones we ask for. PNGs are normally stored (method 0,
+      // no compression); method 8 (deflate) is handled via DecompressionStream.
+
+      async function inflateRaw(data) {
+        const stream = new Response(data).body.pipeThrough(new DecompressionStream('deflate-raw'));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+
+      // Parses the central directory into a name → {offset, compSize, method} map.
+      function readZipIndex(bytes) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        // Find the End Of Central Directory record by scanning backwards for its
+        // signature (0x06054b50). The comment field is almost always empty, so
+        // the limited back-scan is plenty.
+        const SIG_EOCD = 0x06054b50;
+        let eocd = -1;
+        for (let i = bytes.length - 22; i >= 0 && i >= bytes.length - 22 - 65536; i--) {
+          if (view.getUint32(i, true) === SIG_EOCD) { eocd = i; break; }
+        }
+        if (eocd < 0) throw new Error('not a ZIP file (no end-of-central-directory record)');
+
+        const entryCount = view.getUint16(eocd + 10, true);
+        let p = view.getUint32(eocd + 16, true); // central directory offset
+        const index = new Map();
+        const decoder = new TextDecoder();
+        for (let e = 0; e < entryCount; e++) {
+          if (view.getUint32(p, true) !== 0x02014b50) break; // central file header sig
+          const method = view.getUint16(p + 10, true);
+          const compSize = view.getUint32(p + 20, true);
+          const nameLen = view.getUint16(p + 28, true);
+          const extraLen = view.getUint16(p + 30, true);
+          const commentLen = view.getUint16(p + 32, true);
+          const localOffset = view.getUint32(p + 42, true);
+          const name = decoder.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+          index.set(name, { localOffset, compSize, method });
+          p += 46 + nameLen + extraLen + commentLen;
+        }
+        return { bytes, view, index };
+      }
+
+      // Extracts and decompresses a single entry's bytes by name (or null).
+      async function readZipEntry(zip, name) {
+        const entry = zip.index.get(name);
+        if (!entry) return null;
+        // The local file header has its own (possibly different) name/extra
+        // lengths; the compressed data starts after it.
+        const lh = entry.localOffset;
+        if (zip.view.getUint32(lh, true) !== 0x04034b50) return null; // local header sig
+        const nameLen = zip.view.getUint16(lh + 26, true);
+        const extraLen = zip.view.getUint16(lh + 28, true);
+        const dataStart = lh + 30 + nameLen + extraLen;
+        const comp = zip.bytes.subarray(dataStart, dataStart + entry.compSize);
+        if (entry.method === 0) return comp;       // stored
+        if (entry.method === 8) return inflateRaw(comp); // deflate
+        throw new Error(`unsupported ZIP compression method ${entry.method} for ${name}`);
       }
 
       // ============ Phase 2: lazy NBT chunk parser (mirrors src/nbt/) ============
@@ -247,19 +310,41 @@
       // ============ Phase 3: block model + greedy meshing (mirrors src/mesh/) ============
 
       const AIR = new Set(['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air']);
-      // 0 = empty, 1 = opaque, 2 = transparent.
-      const CLASS_EMPTY = 0, CLASS_OPAQUE = 1, CLASS_TRANSPARENT = 2;
+      // Block render classes.
+      //   EMPTY        nothing drawn, never occludes
+      //   OPAQUE       full cube, occludes neighbours
+      //   TRANSPARENT  full cube, draws but doesn't occlude (glass, leaves)
+      //   CROSS        two diagonal quads (plants, flowers, saplings, grass)
+      //   FLUID        full cube, drawn translucent, never occludes (water, lava)
+      const CLASS_EMPTY = 0, CLASS_OPAQUE = 1, CLASS_TRANSPARENT = 2,
+        CLASS_CROSS = 3, CLASS_FLUID = 4;
 
       const TRANSPARENT = new Set(['minecraft:glass', 'minecraft:ice', 'minecraft:frosted_ice',
         'minecraft:slime_block', 'minecraft:honey_block']);
       const TRANSPARENT_SUFFIX = ['_leaves', '_glass', '_glass_pane'];
-      const NON_SOLID = new Set(['minecraft:water', 'minecraft:lava', 'minecraft:fire',
-        'minecraft:redstone_wire', 'minecraft:rail', 'minecraft:torch', 'minecraft:wall_torch',
-        'minecraft:ladder', 'minecraft:snow']);
-      const NON_SOLID_SUFFIX = ['_sapling', '_button', '_pressure_plate', '_carpet'];
+      const FLUID = new Set(['minecraft:water', 'minecraft:lava',
+        'minecraft:flowing_water', 'minecraft:flowing_lava']);
+      // Blocks rendered as a criss-cross of two diagonal quads, the way Minecraft
+      // draws plants. Suffix matches catch the *_sapling / *_flower-ish families.
+      const CROSS = new Set(['minecraft:grass', 'minecraft:short_grass', 'minecraft:tall_grass',
+        'minecraft:fern', 'minecraft:large_fern', 'minecraft:dandelion', 'minecraft:poppy',
+        'minecraft:dead_bush', 'minecraft:sugar_cane', 'minecraft:wheat', 'minecraft:carrots',
+        'minecraft:potatoes', 'minecraft:cornflower', 'minecraft:blue_orchid', 'minecraft:allium',
+        'minecraft:azure_bluet', 'minecraft:oxeye_daisy', 'minecraft:lily_of_the_valley',
+        'minecraft:red_tulip', 'minecraft:orange_tulip', 'minecraft:white_tulip',
+        'minecraft:pink_tulip', 'minecraft:sweet_berry_bush', 'minecraft:nether_wart',
+        'minecraft:brown_mushroom', 'minecraft:red_mushroom', 'minecraft:seagrass']);
+      const CROSS_SUFFIX = ['_sapling'];
+      // Skipped entirely: things the cube/cross mesher can't represent well.
+      const NON_SOLID = new Set(['minecraft:fire', 'minecraft:redstone_wire', 'minecraft:rail',
+        'minecraft:torch', 'minecraft:wall_torch', 'minecraft:ladder', 'minecraft:snow']);
+      const NON_SOLID_SUFFIX = ['_button', '_pressure_plate', '_carpet'];
 
       function classifyName(name) {
         if (AIR.has(name)) return CLASS_EMPTY;
+        if (FLUID.has(name)) return CLASS_FLUID;
+        if (CROSS.has(name)) return CLASS_CROSS;
+        for (const s of CROSS_SUFFIX) if (name.endsWith(s)) return CLASS_CROSS;
         if (NON_SOLID.has(name)) return CLASS_EMPTY;
         for (const s of NON_SOLID_SUFFIX) if (name.endsWith(s)) return CLASS_EMPTY;
         if (TRANSPARENT.has(name)) return CLASS_TRANSPARENT;
@@ -297,6 +382,40 @@
         return c;
       }
 
+      // Tintable blocks ship greyscale textures that Minecraft colorizes from a
+      // biome colormap at runtime. We don't have biome data, so we tint these
+      // with their flat color (a reasonable plains-ish constant); everything else
+      // uses the texture's own colors untinted. Returns 1 if the block's texture
+      // should be multiplied by its flat color, else 0.
+      const TINTED = new Set([
+        'minecraft:grass_block', 'minecraft:grass', 'minecraft:short_grass',
+        'minecraft:tall_grass', 'minecraft:fern', 'minecraft:large_fern',
+        'minecraft:water', 'minecraft:flowing_water', 'minecraft:bubble_column',
+        'minecraft:vine', 'minecraft:lily_pad', 'minecraft:sugar_cane',
+      ]);
+      const TINTED_SUFFIX = ['_leaves'];
+      function tintForName(name) {
+        if (TINTED.has(name)) return 1;
+        for (const s of TINTED_SUFFIX) if (name.endsWith(s)) return 1;
+        return 0;
+      }
+
+      // Global block-name → texture-array-layer registry. Chunk grids carry only
+      // local palettes, but the texture array is one shared resource for the
+      // whole region, so layers are assigned globally and persist across chunks.
+      // Layer -1 means "no texture" (the shader falls back to the flat color).
+      const TEX_LAYERS = new Map();   // block name → layer index (>= 0)
+      const LAYER_NAMES = [];         // layer index → block name (for pack loading)
+      function layerForName(name) {
+        let layer = TEX_LAYERS.get(name);
+        if (layer === undefined) {
+          layer = LAYER_NAMES.length;
+          TEX_LAYERS.set(name, layer);
+          LAYER_NAMES.push(name);
+        }
+        return layer;
+      }
+
       // Flatten a parsed chunk into a padded id grid + per-id class/color tables.
       function buildGrid(chunk) {
         const sections = chunk.sections;
@@ -308,6 +427,8 @@
         const idByName = new Map([['', 0]]);
         const classes = [CLASS_EMPTY];
         const colors = [0];
+        const layers = [-1]; // id 0 is empty → no texture layer
+        const tints = [0];
         const strideZ = 18, strideY = 18 * 18;
         const ids = new Uint16Array(strideY * (sizeY + 2));
 
@@ -323,6 +444,8 @@
               idByName.set(name, gid);
               classes.push(cls);
               colors.push(colorForName(name));
+              layers.push(layerForName(name));
+              tints.push(tintForName(name));
             }
             localToGlobal[p] = gid;
           }
@@ -347,6 +470,7 @@
         return {
           sizeX: 16, sizeY, sizeZ: 16, baseY,
           ids, classes: Uint8Array.from(classes), colors: Uint32Array.from(colors),
+          layers: Int16Array.from(layers), tints: Uint8Array.from(tints),
           strideZ, strideY,
           idAt(x, y, z) { return this.ids[(x + 1) + (z + 1) * this.strideZ + (y + 1) * this.strideY]; },
         };
@@ -355,17 +479,25 @@
       const FACES = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
       const FACE_SHADE = [0.8, 0.8, 1.0, 0.5, 0.7, 0.6];
 
+      // Does the cube face of `here` toward `there` get drawn? Only OPAQUE,
+      // TRANSPARENT and FLUID blocks have cube faces; CROSS blocks are handled
+      // separately, so they're treated like empty here (their neighbour's face
+      // shows through). Same-id transparent/fluid faces are culled so a body of
+      // water or a block of glass doesn't z-fight with itself.
       function faceVisible(hereClass, hereId, thereClass, thereId) {
-        if (thereClass === CLASS_EMPTY) return true;
+        if (thereClass === CLASS_EMPTY || thereClass === CLASS_CROSS) return true;
         if (thereClass === CLASS_OPAQUE) return false;
-        if (hereClass === CLASS_TRANSPARENT && hereId === thereId) return false;
+        // neighbour is transparent or fluid
+        if ((hereClass === CLASS_TRANSPARENT || hereClass === CLASS_FLUID) && hereId === thereId) {
+          return false;
+        }
         return true;
       }
 
-      // Greedy mesh → flat arrays. Returns {positions, normals, colors, indices}.
+      // Greedy mesh → flat arrays. Returns {positions, normals, colors, uvs, layers, tints, indices}.
       function greedyMesh(grid) {
         const dims = [grid.sizeX, grid.sizeY, grid.sizeZ];
-        const positions = [], normals = [], colors = [], indices = [];
+        const positions = [], normals = [], colors = [], uvs = [], texLayers = [], tints = [], indices = [];
         const maskSize = Math.max(dims[0]*dims[1], dims[1]*dims[2], dims[0]*dims[2]);
         const mask = new Int32Array(maskSize);
 
@@ -383,7 +515,8 @@
               for (let uu = 0; uu < uSize; uu++, m++) {
                 coord[axis] = slice; coord[u] = uu; coord[v] = vv;
                 const hereId = grid.idAt(coord[0], coord[1], coord[2]);
-                if (hereId === 0) { mask[m] = 0; continue; }
+                // Cross-shaped plants don't get cube faces; skip them here.
+                if (hereId === 0 || grid.classes[hereId] === CLASS_CROSS) { mask[m] = 0; continue; }
                 ncoord[0] = coord[0]+dx; ncoord[1] = coord[1]+dy; ncoord[2] = coord[2]+dz;
                 const thereId = grid.idAt(ncoord[0], ncoord[1], ncoord[2]);
                 mask[m] = faceVisible(grid.classes[hereId], hereId, grid.classes[thereId], thereId) ? hereId : 0;
@@ -404,7 +537,9 @@
                 const base = [0,0,0]; base[axis] = slice + (dir > 0 ? 1 : 0); base[u] = i; base[v] = j;
                 const du = [0,0,0]; du[u] = w;
                 const dv = [0,0,0]; dv[v] = h;
-                emitQuad(positions, normals, colors, indices, grid.baseY, base, du, dv, dx, dy, dz, dir, grid.colors[id], shade);
+                emitQuad(positions, normals, colors, uvs, texLayers, tints, indices,
+                  grid.baseY, base, du, dv, dx, dy, dz, dir,
+                  grid.colors[id], shade, w, h, grid.layers[id], grid.tints[id], axis, u, v);
                 for (let b = 0; b < h; b++) {
                   const rowBase = (j + b) * uSize + i;
                   for (let a = 0; a < w; a++) mask[rowBase + a] = 0;
@@ -414,16 +549,62 @@
             }
           }
         }
+
+        // Second pass: cross-shaped plants. Each one emits two diagonal quads
+        // forming an X, the way Minecraft draws grass/flowers. No merging, no
+        // culling — they're sparse, and each is double-sided so it's visible
+        // from any angle.
+        for (let y = 0; y < grid.sizeY; y++)
+          for (let z = 0; z < grid.sizeZ; z++)
+            for (let x = 0; x < grid.sizeX; x++) {
+              const id = grid.idAt(x, y, z);
+              if (id === 0 || grid.classes[id] !== CLASS_CROSS) continue;
+              emitCross(positions, normals, colors, uvs, texLayers, tints, indices,
+                grid.baseY, x, y, z, grid.colors[id], grid.layers[id], grid.tints[id]);
+            }
+
         return {
           positions: new Float32Array(positions),
           normals: new Int8Array(normals),
           colors: new Uint8Array(colors),
+          uvs: new Float32Array(uvs),
+          layers: new Float32Array(texLayers),
+          tints: new Float32Array(tints),
           indices: new Uint32Array(indices),
           quadCount: indices.length / 6,
         };
       }
 
-      function emitQuad(positions, normals, colors, indices, baseY, base, du, dv, nx, ny, nz, dir, color, shade) {
+      // Emits the two diagonal quads of a cross-shaped plant at local (x,y,z),
+      // each rendered double-sided (front and back winding) so it shows from any
+      // direction. Full-bright (no face shade) like Minecraft's plants.
+      function emitCross(positions, normals, colors, uvs, texLayers, tints, indices, baseY, x, y, z, color, layer, tint) {
+        const y0 = y + baseY;
+        const r = (color >> 16) & 0xff, g = (color >> 8) & 0xff, b = color & 0xff, a = 255;
+        // Two planes across the block's diagonals, inset slightly from the edges.
+        const quads = [
+          [[x, y0, z], [x+1, y0, z+1], [x+1, y0+1, z+1], [x, y0+1, z]],       // NW-SE
+          [[x+1, y0, z], [x, y0, z+1], [x, y0+1, z+1], [x+1, y0+1, z]],       // NE-SW
+        ];
+        const uv = [[0, 1], [1, 1], [1, 0], [0, 0]]; // v flipped so the plant stands upright
+        for (const q of quads) {
+          const sv = positions.length / 3;
+          for (let k = 0; k < 4; k++) {
+            positions.push(q[k][0], q[k][1], q[k][2]);
+            normals.push(0, 1, 0);
+            colors.push(r, g, b, a);
+            uvs.push(uv[k][0], uv[k][1]);
+            texLayers.push(layer);
+            tints.push(tint);
+          }
+          // Two triangles, both windings → double-sided (visible from both faces).
+          indices.push(sv, sv+1, sv+2, sv, sv+2, sv+3);
+          indices.push(sv, sv+2, sv+1, sv, sv+3, sv+2);
+        }
+      }
+
+      function emitQuad(positions, normals, colors, uvs, texLayers, tints, indices,
+                        baseY, base, du, dv, nx, ny, nz, dir, color, shade, w, h, layer, tint, axis, u, v) {
         const startVertex = positions.length / 3;
         const x0 = base[0], y0 = base[1] + baseY, z0 = base[2];
         const corners = [
@@ -432,12 +613,34 @@
           [x0+du[0]+dv[0], y0+du[1]+dv[1], z0+du[2]+dv[2]],
           [x0+dv[0], y0+dv[1], z0+dv[2]],
         ];
+
+        // Derive each corner's UV straight from its world position so the texture
+        // is upright on every face — independent of the mesher's cyclic u/v axis
+        // choice (the thing that made side faces look sideways). For each face we
+        // pick a horizontal world axis → texture U and vertical → texture V, with
+        // V increasing downward (texture row 0 is the top). Coordinates are taken
+        // relative to the quad's extent; GL_REPEAT tiles them per block.
+        //   top/bottom (axis Y): U = X, V = Z
+        //   X faces:             U = Z, V = world Y (down)
+        //   Z faces:             U = X, V = world Y (down)
+        const yTop = Math.max(corners[0][1], corners[1][1], corners[2][1], corners[3][1]);
+        function cornerUV(c) {
+          if (axis === 1) return [c[0] - x0, c[2] - z0];   // top/bottom
+          if (axis === 0) return [c[2] - z0, yTop - c[1]]; // X face (V down from top)
+          return [c[0] - x0, yTop - c[1]];                 // Z face (V down from top)
+        }
+
         const r = (color >> 16) & 0xff, g = (color >> 8) & 0xff, b = color & 0xff;
         const a = Math.round(shade * 255);
-        for (const c of corners) {
+        for (let k = 0; k < 4; k++) {
+          const c = corners[k];
+          const uvc = cornerUV(c);
           positions.push(c[0], c[1], c[2]);
           normals.push(nx, ny, nz);
           colors.push(r, g, b, a);
+          uvs.push(uvc[0], uvc[1]);
+          texLayers.push(layer);
+          tints.push(tint);
         }
         if (dir > 0) {
           indices.push(startVertex, startVertex+1, startVertex+2, startVertex, startVertex+2, startVertex+3);
@@ -483,21 +686,52 @@
         return o;
       }
 
-      const VERT_SRC = `
-        attribute vec3 aPos;
-        attribute vec3 aNormal;
-        attribute vec4 aColor;
+      // WebGL2 / GLSL ES 3.00. The texture array holds one 16x16 layer per block
+      // type; aLayer selects it. aUV runs 0..w / 0..h so REPEAT tiles the tile
+      // once per block across greedy-merged quads. A negative layer means the
+      // block has no texture loaded — the shader falls back to the flat color.
+      const VERT_SRC = `#version 300 es
+        in vec3 aPos;
+        in vec3 aNormal;
+        in vec4 aColor;
+        in vec2 aUV;
+        in float aLayer;
+        in float aTint;
         uniform mat4 uViewProj;
-        varying vec4 vColor;
+        out vec4 vColor;
+        out vec2 vUV;
+        flat out float vLayer;
+        flat out float vTint;
         void main() {
-          // aColor.a carries baked face shading; fold it into rgb here.
-          vColor = vec4(aColor.rgb * aColor.a, 1.0);
+          vColor = aColor;       // rgb = block/biome tint, a = baked face shade
+          vUV = aUV;
+          vLayer = aLayer;
+          vTint = aTint;
           gl_Position = uViewProj * vec4(aPos, 1.0);
         }`;
-      const FRAG_SRC = `
+      const FRAG_SRC = `#version 300 es
         precision mediump float;
-        varying vec4 vColor;
-        void main() { gl_FragColor = vColor; }`;
+        precision mediump sampler2DArray;
+        in vec4 vColor;
+        in vec2 vUV;
+        flat in float vLayer;
+        flat in float vTint;
+        uniform sampler2DArray uAtlas;
+        uniform bool uUseTexture;
+        out vec4 fragColor;
+        void main() {
+          vec3 base;
+          if (uUseTexture && vLayer >= 0.0) {
+            vec4 tex = texture(uAtlas, vec3(vUV, vLayer));
+            if (tex.a < 0.5) discard; // cut out transparent texels (leaves, plants)
+            // Tinted blocks (grass, leaves, water) ship greyscale and get
+            // colorized; multiply by the flat/biome color. Others pass through.
+            base = (vTint > 0.5) ? tex.rgb * vColor.rgb : tex.rgb;
+          } else {
+            base = vColor.rgb;        // flat-color fallback
+          }
+          fragColor = vec4(base * vColor.a, 1.0); // vColor.a = face shading
+        }`;
 
       function compileShader(gl, type, src) {
         const s = gl.createShader(type);
@@ -511,10 +745,10 @@
 
       const canvas = document.getElementById('gl');
       const statusEl = document.getElementById('status');
-      const gl = canvas.getContext('webgl', { antialias: true });
-      if (!gl) statusEl.textContent = 'WebGL is not available in this browser.';
+      const gl = canvas.getContext('webgl2', { antialias: true });
+      if (!gl) statusEl.textContent = 'WebGL2 is not available in this browser.';
 
-      let program, locPos, locNormal, locColor, locViewProj;
+      let program, locPos, locNormal, locColor, locUV, locLayer, locTint, locViewProj, locAtlas, locUseTexture;
       if (gl) {
         program = gl.createProgram();
         gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERT_SRC));
@@ -526,36 +760,51 @@
         locPos = gl.getAttribLocation(program, 'aPos');
         locNormal = gl.getAttribLocation(program, 'aNormal');
         locColor = gl.getAttribLocation(program, 'aColor');
+        locUV = gl.getAttribLocation(program, 'aUV');
+        locLayer = gl.getAttribLocation(program, 'aLayer');
+        locTint = gl.getAttribLocation(program, 'aTint');
         locViewProj = gl.getUniformLocation(program, 'uViewProj');
+        locAtlas = gl.getUniformLocation(program, 'uAtlas');
+        locUseTexture = gl.getUniformLocation(program, 'uUseTexture');
         gl.enable(gl.DEPTH_TEST);
         gl.enable(gl.CULL_FACE);
         gl.cullFace(gl.BACK);
         gl.clearColor(0.05, 0.05, 0.07, 1);
       }
 
-      // One GPU-resident chunk: its buffers plus an AABB for frustum culling.
-      // mesh fields: posBuf, normBuf, colBuf, idxBuf, count (indices), center, radius.
+      // One GPU-resident chunk: a VAO wrapping its attribute buffers, plus a
+      // bounding sphere for frustum culling.
       const chunkMeshes = [];
 
+      function makeBuffer(target, data, location, size, type, normalized) {
+        const buf = gl.createBuffer();
+        gl.bindBuffer(target, buf);
+        gl.bufferData(target, data, gl.STATIC_DRAW);
+        if (location >= 0) {
+          gl.enableVertexAttribArray(location);
+          gl.vertexAttribPointer(location, size, type, normalized, 0, 0);
+        }
+        return buf;
+      }
+
       function uploadMesh(mesh, originX, originZ) {
-        const posBuf = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+        const vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
+
         // Bake world origin into positions so the shader needs no per-chunk model matrix.
         const p = mesh.positions;
         for (let i = 0; i < p.length; i += 3) { p[i] += originX; p[i+2] += originZ; }
-        gl.bufferData(gl.ARRAY_BUFFER, p, gl.STATIC_DRAW);
 
-        const normBuf = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.STATIC_DRAW);
-
-        const colBuf = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, mesh.colors, gl.STATIC_DRAW);
-
-        const idxBuf = gl.createBuffer();
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+        const buffers = [
+          makeBuffer(gl.ARRAY_BUFFER, p, locPos, 3, gl.FLOAT, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.normals, locNormal, 3, gl.BYTE, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.colors, locColor, 4, gl.UNSIGNED_BYTE, true),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.uvs, locUV, 2, gl.FLOAT, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.layers, locLayer, 1, gl.FLOAT, false),
+          makeBuffer(gl.ARRAY_BUFFER, mesh.tints, locTint, 1, gl.FLOAT, false),
+          makeBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, -1, 0, 0, false),
+        ];
+        gl.bindVertexArray(null);
 
         // Bounding sphere from the position extent.
         let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
@@ -566,13 +815,13 @@
         }
         const center = [(minX+maxX)/2, (minY+maxY)/2, (minZ+maxZ)/2];
         const radius = Math.hypot(maxX-center[0], maxY-center[1], maxZ-center[2]);
-        chunkMeshes.push({ posBuf, normBuf, colBuf, idxBuf, count: mesh.indices.length, center, radius });
+        chunkMeshes.push({ vao, buffers, count: mesh.indices.length, center, radius });
       }
 
       function clearMeshes() {
         for (const m of chunkMeshes) {
-          gl.deleteBuffer(m.posBuf); gl.deleteBuffer(m.normBuf);
-          gl.deleteBuffer(m.colBuf); gl.deleteBuffer(m.idxBuf);
+          gl.deleteVertexArray(m.vao);
+          for (const b of m.buffers) gl.deleteBuffer(b);
         }
         chunkMeshes.length = 0;
       }
@@ -635,34 +884,143 @@
 
         gl.useProgram(program);
         gl.uniformMatrix4fv(locViewProj, false, viewProj);
+        gl.uniform1i(locUseTexture, atlasTexture ? 1 : 0);
+        if (atlasTexture) {
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTexture);
+          gl.uniform1i(locAtlas, 0);
+        }
 
         let drawn = 0;
         for (const m of chunkMeshes) {
           if (!sphereInFrustum(frustum, m.center, m.radius)) continue; // frustum culling
-          gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf);
-          gl.enableVertexAttribArray(locPos);
-          gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, 0, 0);
-          gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf);
-          gl.enableVertexAttribArray(locNormal);
-          gl.vertexAttribPointer(locNormal, 3, gl.BYTE, false, 0, 0);
-          gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf);
-          gl.enableVertexAttribArray(locColor);
-          gl.vertexAttribPointer(locColor, 4, gl.UNSIGNED_BYTE, true, 0, 0);
-          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf);
+          gl.bindVertexArray(m.vao);
           gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
           drawn++;
         }
+        gl.bindVertexArray(null);
         drawnLast = drawn;
         requestAnimationFrame(render);
       }
 
-      // UNSIGNED_INT indices need OES_element_index_uint on WebGL1.
-      if (gl) {
-        if (!gl.getExtension('OES_element_index_uint')) {
-          statusEl.textContent = 'This browser lacks 32-bit index support; large chunks may not render.';
-        }
-        requestAnimationFrame(render);
+      // WebGL2 has 32-bit indices and VAOs built in — no extensions needed.
+      if (gl) requestAnimationFrame(render);
+
+      // ============ resource-pack textures (TEXTURE_2D_ARRAY) ============
+
+      const TILE = 16;            // Minecraft block textures are 16x16
+      let atlasTexture = null;    // sampler2DArray, or null = flat-color mode
+
+      // Block id → texture base name. Most blocks' top/side texture matches the
+      // block name, but plenty don't, so a small alias table covers the common
+      // mismatches; anything unlisted just tries "<name>.png".
+      const TEXTURE_ALIAS = {
+        'grass_block': 'grass_block_top',
+        'podzol': 'podzol_top',
+        'mycelium': 'mycelium_top',
+        'dirt_path': 'dirt_path_top',
+        'farmland': 'farmland',
+        'oak_log': 'oak_log', 'spruce_log': 'spruce_log', 'birch_log': 'birch_log',
+        'jungle_log': 'jungle_log', 'acacia_log': 'acacia_log', 'dark_oak_log': 'dark_oak_log',
+        'sandstone': 'sandstone_top', 'red_sandstone': 'red_sandstone_top',
+        'snow_block': 'snow', 'snow': 'snow',
+        'tnt': 'tnt_side', 'crafting_table': 'crafting_table_top',
+        'bookshelf': 'bookshelf', 'furnace': 'furnace_front',
+        'pumpkin': 'pumpkin_side', 'melon': 'melon_side',
+        'hay_block': 'hay_block_top', 'bone_block': 'bone_block_top',
+        'quartz_block': 'quartz_block_top', 'nether_quartz_ore': 'nether_quartz_ore',
+      };
+
+      function textureCandidates(blockName) {
+        const short = blockName.startsWith('minecraft:') ? blockName.slice(10) : blockName;
+        const names = [];
+        if (TEXTURE_ALIAS[short]) names.push(TEXTURE_ALIAS[short]);
+        names.push(short);
+        names.push(short + '_top');   // many blocks only ship *_top/_side variants
+        names.push(short + '_side');
+        return names;
       }
+
+      // Decodes a PNG (as bytes) to a 16x16 RGBA Uint8Array via an ImageBitmap.
+      // Non-16x16 textures (animated, hi-res packs) are drawn scaled to 16x16.
+      async function decodeTile(pngBytes) {
+        const bitmap = await createImageBitmap(new Blob([pngBytes], { type: 'image/png' }));
+        const c = document.createElement('canvas');
+        c.width = TILE; c.height = TILE;
+        const cx = c.getContext('2d');
+        cx.imageSmoothingEnabled = false;
+        // Animated textures are tall strips; sample only the top frame.
+        const frameH = bitmap.height >= bitmap.width ? bitmap.width : bitmap.height;
+        cx.drawImage(bitmap, 0, 0, bitmap.width, frameH, 0, 0, TILE, TILE);
+        bitmap.close();
+        return new Uint8Array(cx.getImageData(0, 0, TILE, TILE).data.buffer);
+      }
+
+      // Builds the texture array from a loaded resource pack. One layer per block
+      // name seen so far (LAYER_NAMES); missing textures stay fully transparent
+      // so the shader falls back to that block's flat color.
+      async function buildAtlas(zip) {
+        const layerCount = LAYER_NAMES.length;
+        if (layerCount === 0) return;
+
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+        // Allocate the full mip pyramid up front (immutable storage), then fill
+        // each layer's base level; generateMipmap fills the rest.
+        const mipLevels = Math.log2(TILE) + 1; // 16 -> 5 levels
+        gl.texStorage3D(gl.TEXTURE_2D_ARRAY, mipLevels, gl.RGBA8, TILE, TILE, layerCount);
+
+        let found = 0;
+        for (let layer = 0; layer < layerCount; layer++) {
+          let pixels = null;
+          for (const cand of textureCandidates(LAYER_NAMES[layer])) {
+            const png = await readZipEntry(zip, `assets/minecraft/textures/block/${cand}.png`);
+            if (png) { try { pixels = await decodeTile(png); found++; break; } catch {} }
+          }
+          if (pixels === null) continue; // leave transparent → flat-color fallback
+          gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, TILE, TILE, 1,
+            gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        }
+
+        // Mipmaps are the zoom optimization: when a block shrinks to a few pixels
+        // on screen, the GPU samples a lower-res mip instead of the full tile,
+        // killing both aliasing and texture-bandwidth waste.
+        gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST_MIPMAP_LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
+        // Sharpen distant tiles where the driver supports anisotropy.
+        const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+        if (aniso) {
+          const max = gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+          gl.texParameterf(gl.TEXTURE_2D_ARRAY, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, max));
+        }
+
+        if (atlasTexture) gl.deleteTexture(atlasTexture);
+        atlasTexture = tex;
+        return found;
+      }
+
+      let pendingPackZip = null; // a pack picked before any region was loaded
+      async function applyPack(file) {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const zip = readZipIndex(bytes);
+        pendingPackZip = zip;
+        if (LAYER_NAMES.length === 0) {
+          statusEl.textContent = 'Resource pack ready — now load a region to texture it.';
+          return;
+        }
+        const found = await buildAtlas(zip);
+        statusEl.textContent = `Textured ${found}/${LAYER_NAMES.length} block types from ${file.name}.`;
+      }
+
+      document.getElementById('pack').addEventListener('change', async (ev) => {
+        const file = ev.target.files && ev.target.files[0];
+        if (!file || !gl) return;
+        try { await applyPack(file); }
+        catch (err) { statusEl.textContent = `Failed to read pack ${file.name}: ${err.message || err}`; }
+      });
 
       // ============ load + mesh a region ============
 
@@ -670,6 +1028,11 @@
       async function loadRegion(file) {
         const token = ++loadToken;
         clearMeshes();
+        // Old meshes are gone, so their global texture layers are too — reset the
+        // registry so this region's blocks reindex from 0 and match a fresh atlas.
+        TEX_LAYERS.clear();
+        LAYER_NAMES.length = 0;
+        if (atlasTexture) { gl.deleteTexture(atlasTexture); atlasTexture = null; }
         const region = await openRegion(file);
         const coords = [];
         for (let i = 0; i < 1024; i++) if (region.locations[i] !== 0) coords.push(i);
@@ -713,9 +1076,18 @@
 
         if (n > 0) { cam.target[0] = sumX / n; cam.target[2] = sumZ / n; cam.dist = 700; }
         const secs = ((performance.now() - t0) / 1000).toFixed(2);
-        statusEl.textContent =
-          `${file.name}: ${total} chunks, ${quads.toLocaleString()} quads in ${secs} s` +
-          (failed ? ` (${failed} unreadable)` : '') + '. Drag to orbit.';
+        let msg = `${file.name}: ${total} chunks, ${quads.toLocaleString()} quads in ${secs} s` +
+          (failed ? ` (${failed} unreadable)` : '');
+
+        // If a resource pack was picked, texture the blocks we just discovered.
+        if (pendingPackZip && LAYER_NAMES.length > 0) {
+          const found = await buildAtlas(pendingPackZip);
+          if (token !== loadToken) return;
+          msg += `. Textured ${found}/${LAYER_NAMES.length} block types.`;
+        } else {
+          msg += '. Drag to orbit. (Load a resource pack for textures.)';
+        }
+        statusEl.textContent = msg;
       }
 
       document.getElementById('file').addEventListener('change', async (ev) => {

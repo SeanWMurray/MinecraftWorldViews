@@ -10,12 +10,15 @@ import type { VoxelGrid } from './voxel-grid';
  *   positions  Float32Array  x,y,z per vertex (world-local; add chunk origin)
  *   normals    Int8Array     nx,ny,nz per vertex (one of the 6 axis dirs)
  *   colors     Uint8Array    r,g,b,a per vertex (a carries face shading)
+ *   uvs        Float32Array  u,v per vertex; ranges 0..w / 0..h across a merged
+ *                            quad so a per-block texture tiles under GL_REPEAT
  *   indices    Uint32Array   two triangles per quad
  */
 export interface ChunkMesh {
   positions: Float32Array;
   normals: Int8Array;
   colors: Uint8Array;
+  uvs: Float32Array;
   indices: Uint32Array;
   /** Number of quads emitted (positions.length === quadCount*4*3). */
   quadCount: number;
@@ -76,6 +79,7 @@ export function greedyMesh(grid: VoxelGrid): ChunkMesh {
   const positions: number[] = [];
   const normals: number[] = [];
   const colors: number[] = [];
+  const uvs: number[] = [];
   const indices: number[] = [];
   let quadCount = 0;
 
@@ -158,8 +162,8 @@ export function greedyMesh(grid: VoxelGrid): ChunkMesh {
 
           const color = grid.colors[id];
           emitQuad(
-            positions, normals, colors, indices,
-            grid.baseY, base, du, dv, dx, dy, dz, dir, color, shade,
+            positions, normals, colors, uvs, indices,
+            grid.baseY, base, du, dv, dx, dy, dz, dir, color, shade, w, h,
           );
           quadCount++;
 
@@ -178,6 +182,7 @@ export function greedyMesh(grid: VoxelGrid): ChunkMesh {
     positions: Float32Array.from(positions),
     normals: Int8Array.from(normals),
     colors: Uint8Array.from(colors),
+    uvs: Float32Array.from(uvs),
     indices: Uint32Array.from(indices),
     quadCount,
   };
@@ -187,6 +192,7 @@ function emitQuad(
   positions: number[],
   normals: number[],
   colors: number[],
+  uvs: number[],
   indices: number[],
   baseY: number,
   base: number[],
@@ -198,6 +204,8 @@ function emitQuad(
   dir: number,
   color: number,
   shade: number,
+  w: number,
+  h: number,
 ): void {
   const startVertex = positions.length / 3;
 
@@ -210,15 +218,26 @@ function emitQuad(
     [x0 + dv[0], y0 + dv[1], z0 + dv[2]],
   ];
 
+  // UVs span 0..w / 0..h so a per-block texture tiles across the merged quad
+  // under GL_REPEAT (each integer step wraps back to a single block tile).
+  const cornerUVs = [
+    [0, 0],
+    [w, 0],
+    [w, h],
+    [0, h],
+  ];
+
   const r = (color >> 16) & 0xff;
   const g = (color >> 8) & 0xff;
   const b = color & 0xff;
   const a = Math.round(shade * 255);
 
-  for (const c of corners) {
+  for (let k = 0; k < 4; k++) {
+    const c = corners[k];
     positions.push(c[0], c[1], c[2]);
     normals.push(nx, ny, nz);
     colors.push(r, g, b, a);
+    uvs.push(cornerUVs[k][0], cornerUVs[k][1]);
   }
 
   // Wind so the front face points along the normal. For negative directions we

@@ -58,6 +58,22 @@ describe('greedyMesh single cube', () => {
     // 6 quads * 4 vertices * 3 components.
     expect(mesh.positions.length).toBe(6 * 4 * 3);
     expect(mesh.indices.length).toBe(6 * 6);
+    // One UV pair per vertex; a 1x1 face spans the tile exactly once (0..1).
+    expect(mesh.uvs.length).toBe(6 * 4 * 2);
+    for (const u of mesh.uvs) expect(u === 0 || u === 1).toBe(true);
+  });
+});
+
+describe('greedyMesh tiling UVs', () => {
+  it('grows UVs with the merged quad so textures tile per block', () => {
+    // A flat 16x16 floor merges its top into one quad; UVs must reach 16 so a
+    // per-block texture tiles 16 times under GL_REPEAT instead of stretching.
+    const palette = [state('minecraft:air'), state('minecraft:stone')];
+    const chunk = chunkFromFill(palette, (x, y, z) => (y === 0 ? 1 : 0));
+    const mesh = greedyMesh(VoxelGrid.fromChunk(chunk)!);
+    let maxU = 0;
+    for (const u of mesh.uvs) maxU = Math.max(maxU, u);
+    expect(maxU).toBe(16);
   });
 });
 

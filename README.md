@@ -21,7 +21,7 @@ draw calls.
 | 1. I/O & decompression | Stream `.mca` region files, ranged reads, native `DecompressionStream`, worker pool | ya |
 | 2. NBT & blockstates | Lazy NBT parser, bit-packed palette extraction | kinda |
 | 3. Geometry & meshing | Greedy meshing + internal-face & transparency culling | ya |
-| 4. WebGL rendering | Per-chunk static buffers, frustum culling, orbit camera | kinda |
+| 4. WebGL rendering | WebGL2, per-chunk buffers, frustum culling, texture-array textures + mipmaps | kinda |
 
 ## Architecture
 
@@ -78,11 +78,21 @@ test/                      Vitest suite with synthetic region files & NBT
   merges adjacent same-block coplanar faces into maximal quads. Internal faces and faces
   hidden by opaque neighbours are culled; same-material transparent faces are culled too,
   so a block of glass doesn't z-fight with itself. Output is exactly-sized flat typed
-  arrays (`Float32Array` positions, `Int8Array` normals, `Uint8Array` RGBA, `Uint32Array`
-  indices) — upload-ready with no further JS. No Wasm, so it still runs straight from disk.
-- **Frustum-culled draw.** Each chunk uploads to its own static WebGL buffers once; a
-  per-frame bounding-sphere test against the view-frustum planes skips off-screen chunks.
-  Face shading is baked into vertex alpha, so the fragment shader does no lighting.
+  arrays (`Float32Array` positions, `Int8Array` normals, `Uint8Array` RGBA, `Float32Array`
+  tiling UVs, `Uint32Array` indices) — upload-ready with no further JS. No Wasm, so it
+  still runs straight from disk.
+- **Frustum-culled draw.** Each chunk uploads to its own static WebGL2 buffers (one VAO)
+  once; a per-frame bounding-sphere test against the view-frustum planes skips off-screen
+  chunks. Face shading is baked into vertex alpha, so the fragment shader does no lighting.
+- **Texture array, not an atlas.** Block textures load into one `TEXTURE_2D_ARRAY` (one
+  layer per block type), so the whole region draws with a single texture bind and no
+  per-tile UV math. Greedy-merged quads carry UVs that run 0..width / 0..height, so a
+  `REPEAT` wrap tiles each block's texture instead of stretching one copy across the merged
+  face — the reason an atlas wouldn't work here.
+- **Mipmapped zoom.** The texture array is mipmapped, so when you zoom out and a block
+  shrinks to a couple of pixels the GPU samples a low-res mip automatically: no aliasing
+  shimmer, and a fraction of the texture bandwidth. (Anisotropic filtering is enabled where
+  the driver supports it.)
 
 ## Usage
 
@@ -116,6 +126,7 @@ if (mesh) {
   // mesh.positions: Float32Array  (x,y,z per vertex; add chunk.x*16 / chunk.z*16)
   // mesh.normals:   Int8Array     (axis-aligned face normal per vertex)
   // mesh.colors:    Uint8Array    (r,g,b,a; alpha is baked face shading)
+  // mesh.uvs:       Float32Array  (u,v; 0..w / 0..h so a per-block texture tiles)
   // mesh.indices:   Uint32Array   (two triangles per quad)
   gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
 }
@@ -131,8 +142,11 @@ no build, no server.
   at the cursor), drag to pan, double-click to reset, and click anywhere to identify the
   surface block and its height.
 - **`viewer.html` — 3D view.** Pick an `.mca` file and it greedy-meshes every chunk and
-  renders the region in WebGL. Drag to orbit, scroll to zoom, right-drag or WASD to pan,
-  and press R to reset the camera.
+  renders the region in WebGL2. Drag to orbit, scroll to zoom, right-drag or WASD to pan,
+  and press R to reset the camera. For real block textures, also pick a **resource pack**
+  (`.zip`/`.jar`) with the "textures" picker — it's read in-browser and textures every
+  block type it has art for; blocks it doesn't fall back to a flat color. Without a pack,
+  everything renders in flat colors.
 
 (Both pages inline the Phase 1-3 pipeline as a classic script because browsers block ES
 module imports and Web Workers on pages opened from disk. WebGL itself has no such
