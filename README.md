@@ -89,10 +89,14 @@ test/                      Vitest suite with synthetic region files & NBT
   per-tile UV math. Greedy-merged quads carry UVs that run 0..width / 0..height, so a
   `REPEAT` wrap tiles each block's texture instead of stretching one copy across the merged
   face — the reason an atlas wouldn't work here.
-- **Mipmapped zoom.** The texture array is mipmapped, so when you zoom out and a block
-  shrinks to a couple of pixels the GPU samples a low-res mip automatically: no aliasing
-  shimmer, and a fraction of the texture bandwidth. (Anisotropic filtering is enabled where
-  the driver supports it.)
+- **Level-of-detail textures.** The texture array is mipmapped, so a far-off block samples
+  a low-res mip automatically (no aliasing shimmer, a fraction of the texture bandwidth)
+  while a block up close samples the full-resolution base level. Filtering is
+  `NEAREST_MIPMAP_NEAREST` + `NEAREST` mag, so each mip stays pixel-crisp instead of
+  blurring two mips together up close. The array is built at the *pack's* native tile size
+  (16/32/64px, capped at 128), detected from its first block texture — so a hi-res pack
+  keeps its detail when you get close instead of being downscaled to 16px. (Anisotropic
+  filtering is enabled where the driver supports it.)
 
 ## Usage
 
@@ -142,8 +146,8 @@ no build, no server.
   at the cursor), drag to pan, double-click to reset, and click anywhere to identify the
   surface block and its height.
 - **`viewer.html` — 3D view.** Pick an `.mca` file and it greedy-meshes every chunk and
-  renders the region in WebGL2. Drag to orbit, scroll to zoom, right-drag or WASD to pan,
-  and press R to reset the camera. For real block textures, also pick a **resource pack**
+  renders the region in WebGL2. Drag to orbit, scroll to zoom, right-drag / Ctrl-drag / WASD
+  to pan, and press R to reset the camera. For real block textures, also pick a **resource pack**
   (`.zip`/`.jar`) with the "textures" picker — it's read in-browser and textures every
   block type it has art for; blocks it doesn't fall back to a flat color. Without a pack,
   everything renders in flat colors.

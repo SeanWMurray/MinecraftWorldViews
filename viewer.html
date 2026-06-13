@@ -27,7 +27,7 @@
       <span style="margin-left:auto"><a href="index.html">2D map →</a></span>
     </div>
     <canvas id="gl"></canvas>
-    <div id="hint">drag to orbit · scroll to zoom · right-drag or WASD to pan · R to reset · load a resource pack for textures</div>
+    <div id="hint">drag to orbit · scroll to zoom · right-drag, Ctrl-drag, or WASD to pan · R to reset · load a resource pack for textures</div>
 
     <!--
       Self-contained 3D region viewer. Runs straight from disk (file://): WebGL
@@ -515,11 +515,15 @@
               for (let uu = 0; uu < uSize; uu++, m++) {
                 coord[axis] = slice; coord[u] = uu; coord[v] = vv;
                 const hereId = grid.idAt(coord[0], coord[1], coord[2]);
+                const hereClass = hereId === 0 ? 0 : grid.classes[hereId];
                 // Cross-shaped plants don't get cube faces; skip them here.
-                if (hereId === 0 || grid.classes[hereId] === CLASS_CROSS) { mask[m] = 0; continue; }
+                if (hereId === 0 || hereClass === CLASS_CROSS) { mask[m] = 0; continue; }
+                // Fluids render as just their top surface (only the +Y face, f===2)
+                // — a flat water/lava sheet, not full submerged cube walls.
+                if (hereClass === CLASS_FLUID && f !== 2) { mask[m] = 0; continue; }
                 ncoord[0] = coord[0]+dx; ncoord[1] = coord[1]+dy; ncoord[2] = coord[2]+dz;
                 const thereId = grid.idAt(ncoord[0], ncoord[1], ncoord[2]);
-                mask[m] = faceVisible(grid.classes[hereId], hereId, grid.classes[thereId], thereId) ? hereId : 0;
+                mask[m] = faceVisible(hereClass, hereId, grid.classes[thereId], thereId) ? hereId : 0;
               }
             }
             for (let j = 0; j < vSize; j++) {
@@ -710,20 +714,38 @@
           gl_Position = uViewProj * vec4(aPos, 1.0);
         }`;
       const FRAG_SRC = `#version 300 es
-        precision mediump float;
-        precision mediump sampler2DArray;
+        precision highp float;
+        precision highp sampler2DArray;
         in vec4 vColor;
         in vec2 vUV;
         flat in float vLayer;
         flat in float vTint;
         uniform sampler2DArray uAtlas;
         uniform bool uUseTexture;
+        uniform float uTexelSize; // texels per tile (TILE: 16/32/64/128)
         out vec4 fragColor;
         void main() {
           vec3 base;
           if (uUseTexture && vLayer >= 0.0) {
-            vec4 tex = texture(uAtlas, vec3(vUV, vLayer));
-            if (tex.a < 0.5) discard; // cut out transparent texels (leaves, plants)
+            // Analytic anti-aliasing ("blocky filter"): instead of a LOD bias or
+            // NEAREST (which both trade crispness for aliasing), we snap the UV to
+            // texel centres and let it sprint across a boundary over exactly one
+            // screen pixel (fwidth). The hardware LINEAR sampler then returns the
+            // pure texel colour everywhere except that 1px edge — crisp up close,
+            // smooth mip blending far away, and anisotropy without blurring.
+            vec2 res = vec2(uTexelSize);
+            vec2 shifted = vUV * res - 0.5;         // texel space, boundary-centred
+            vec2 fl = floor(shifted);
+            vec2 fr = fract(shifted);
+            vec2 duv = fwidth(shifted);             // UV change per screen pixel
+            fr = clamp((fr - 0.5) / duv + 0.5, 0.0, 1.0);
+            vec2 sharpUV = (fl + fr + 0.5) / res;   // back to 0..w tile UV space
+            vec4 tex = texture(uAtlas, vec3(sharpUV, vLayer));
+            // Alpha-test cutout for plants/leaves: their texture is transparent
+            // (including antialiased fringe) around the shape, so a 0.5 threshold
+            // crops cleanly. Water is forced opaque before upload (see decodeTile/
+            // the fluid path), so it isn't discarded here.
+            if (tex.a < 0.5) discard;
             // Tinted blocks (grass, leaves, water) ship greyscale and get
             // colorized; multiply by the flat/biome color. Others pass through.
             base = (vTint > 0.5) ? tex.rgb * vColor.rgb : tex.rgb;
@@ -748,7 +770,7 @@
       const gl = canvas.getContext('webgl2', { antialias: true });
       if (!gl) statusEl.textContent = 'WebGL2 is not available in this browser.';
 
-      let program, locPos, locNormal, locColor, locUV, locLayer, locTint, locViewProj, locAtlas, locUseTexture;
+      let program, locPos, locNormal, locColor, locUV, locLayer, locTint, locViewProj, locAtlas, locUseTexture, locTexelSize;
       if (gl) {
         program = gl.createProgram();
         gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERT_SRC));
@@ -766,6 +788,7 @@
         locViewProj = gl.getUniformLocation(program, 'uViewProj');
         locAtlas = gl.getUniformLocation(program, 'uAtlas');
         locUseTexture = gl.getUniformLocation(program, 'uUseTexture');
+        locTexelSize = gl.getUniformLocation(program, 'uTexelSize');
         gl.enable(gl.DEPTH_TEST);
         gl.enable(gl.CULL_FACE);
         gl.cullFace(gl.BACK);
@@ -889,6 +912,7 @@
           gl.activeTexture(gl.TEXTURE0);
           gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTexture);
           gl.uniform1i(locAtlas, 0);
+          gl.uniform1f(locTexelSize, TILE); // analytic-AA needs the tile resolution
         }
 
         let drawn = 0;
@@ -908,8 +932,25 @@
 
       // ============ resource-pack textures (TEXTURE_2D_ARRAY) ============
 
-      const TILE = 16;            // Minecraft block textures are 16x16
+      // Tile resolution. Vanilla art is 16x16, but hi-res packs ship 32/64/128px
+      // textures. We detect the pack's native size from its first block texture
+      // and build the array at that resolution, so "full detail when you get
+      // close" actually means the pack's full detail — not a 16px downscale.
+      let TILE = 16;
+      const MAX_TILE = 128;       // cap so a 512px pack doesn't blow up VRAM
       let atlasTexture = null;    // sampler2DArray, or null = flat-color mode
+
+      // Filtering for the analytic-AA shader: we hand the hardware LINEAR sampler
+      // exact texel centres (the fragment shader snaps UVs), so LINEAR returns the
+      // pure texel colour everywhere except a 1px boundary it blends. Trilinear
+      // min (LINEAR_MIPMAP_LINEAR) gives smooth, alias-free minification far away.
+      function applyTexFilter(tex) {
+        tex = tex || atlasTexture;
+        if (!tex) return;
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      }
 
       // Block id → texture base name. Most blocks' top/side texture matches the
       // block name, but plenty don't, so a small alias table covers the common
@@ -938,22 +979,39 @@
         names.push(short);
         names.push(short + '_top');   // many blocks only ship *_top/_side variants
         names.push(short + '_side');
+        names.push(short + '_still');  // fluids: water_still / lava_still
+        names.push(short + '_flow');
         return names;
       }
 
-      // Decodes a PNG (as bytes) to a 16x16 RGBA Uint8Array via an ImageBitmap.
-      // Non-16x16 textures (animated, hi-res packs) are drawn scaled to 16x16.
-      async function decodeTile(pngBytes) {
+      // Decodes a PNG (as bytes) to a TILE×TILE RGBA Uint8Array via an ImageBitmap.
+      // Textures bigger than TILE (hi-res packs) sample down to TILE; smaller ones
+      // scale up. Animated textures are tall strips — we sample only the top frame.
+      async function decodeTile(pngBytes, opaque = false) {
         const bitmap = await createImageBitmap(new Blob([pngBytes], { type: 'image/png' }));
         const c = document.createElement('canvas');
         c.width = TILE; c.height = TILE;
         const cx = c.getContext('2d');
-        cx.imageSmoothingEnabled = false;
-        // Animated textures are tall strips; sample only the top frame.
+        cx.imageSmoothingEnabled = false;   // keep texels crisp (nearest-neighbour)
         const frameH = bitmap.height >= bitmap.width ? bitmap.width : bitmap.height;
         cx.drawImage(bitmap, 0, 0, bitmap.width, frameH, 0, 0, TILE, TILE);
         bitmap.close();
-        return new Uint8Array(cx.getImageData(0, 0, TILE, TILE).data.buffer);
+        const px = new Uint8Array(cx.getImageData(0, 0, TILE, TILE).data.buffer);
+        // Fluids ship translucent; force alpha to 255 so the shader's alpha-test
+        // cutout (for plant/leaf transparency) doesn't discard the water surface.
+        if (opaque) for (let i = 3; i < px.length; i += 4) px[i] = 255;
+        return px;
+      }
+
+      // Probes one PNG's native width (square frame) so we can size the whole
+      // array to the pack's resolution. Returns 0 if it can't decode.
+      async function probeTileSize(pngBytes) {
+        try {
+          const bitmap = await createImageBitmap(new Blob([pngBytes], { type: 'image/png' }));
+          const w = bitmap.width;
+          bitmap.close();
+          return w;
+        } catch { return 0; }
       }
 
       // Builds the texture array from a loaded resource pack. One layer per block
@@ -963,38 +1021,63 @@
         const layerCount = LAYER_NAMES.length;
         if (layerCount === 0) return;
 
+        // Pass 0: resolve each layer to a found texture path, and detect the
+        // pack's native resolution from the first one we hit. Sizing the array to
+        // the pack means a 32/64px pack keeps its detail close up; mipmaps then
+        // scale that detail down with distance instead of us throwing it away.
+        const paths = new Array(layerCount).fill(null);
+        let native = 0;
+        for (let layer = 0; layer < layerCount; layer++) {
+          for (const cand of textureCandidates(LAYER_NAMES[layer])) {
+            const path = `assets/minecraft/textures/block/${cand}.png`;
+            const png = await readZipEntry(zip, path);
+            if (png) {
+              paths[layer] = png;
+              if (native === 0) native = await probeTileSize(png);
+              break;
+            }
+          }
+        }
+        // Round to a power of two within [16, MAX_TILE] so mip generation is exact.
+        let t = native > 0 ? native : 16;
+        t = Math.pow(2, Math.round(Math.log2(t)));
+        TILE = Math.max(16, Math.min(MAX_TILE, t));
+
         const tex = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
         // Allocate the full mip pyramid up front (immutable storage), then fill
         // each layer's base level; generateMipmap fills the rest.
-        const mipLevels = Math.log2(TILE) + 1; // 16 -> 5 levels
+        const mipLevels = Math.log2(TILE) + 1; // 16->5, 32->6, 64->7 ...
         gl.texStorage3D(gl.TEXTURE_2D_ARRAY, mipLevels, gl.RGBA8, TILE, TILE, layerCount);
 
         let found = 0;
         for (let layer = 0; layer < layerCount; layer++) {
+          if (paths[layer] === null) continue; // leave transparent → flat-color fallback
+          const isFluid = classifyName(LAYER_NAMES[layer]) === CLASS_FLUID;
           let pixels = null;
-          for (const cand of textureCandidates(LAYER_NAMES[layer])) {
-            const png = await readZipEntry(zip, `assets/minecraft/textures/block/${cand}.png`);
-            if (png) { try { pixels = await decodeTile(png); found++; break; } catch {} }
-          }
-          if (pixels === null) continue; // leave transparent → flat-color fallback
+          try { pixels = await decodeTile(paths[layer], isFluid); } catch {}
+          if (pixels === null) continue;
+          found++;
           gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, TILE, TILE, 1,
             gl.RGBA, gl.UNSIGNED_BYTE, pixels);
         }
 
-        // Mipmaps are the zoom optimization: when a block shrinks to a few pixels
-        // on screen, the GPU samples a lower-res mip instead of the full tile,
-        // killing both aliasing and texture-bandwidth waste.
+        // Level-of-detail: generateMipmap builds the down-scaled pyramid, so a
+        // block far away samples a low-res mip (cheap, no aliasing shimmer) while
+        // a block up close samples mip 0 at full resolution.
         gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
-        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST_MIPMAP_LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT);
         gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
-        // Sharpen distant tiles where the driver supports anisotropy.
+        applyTexFilter(tex);   // LINEAR + trilinear; the shader provides sharpness
+        // Anisotropic filtering is the real fix for ground/terrain blur: a floor
+        // seen at a shallow angle is squished along the view direction, so plain
+        // mipmapping (which picks one mip for both axes) blurs the still-sharp
+        // axis to match the squished one. Anisotropy samples the sharp axis at
+        // full detail. Push it to the driver max.
         const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
         if (aniso) {
           const max = gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
-          gl.texParameterf(gl.TEXTURE_2D_ARRAY, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, max));
+          gl.texParameterf(gl.TEXTURE_2D_ARRAY, aniso.TEXTURE_MAX_ANISOTROPY_EXT, max);
         }
 
         if (atlasTexture) gl.deleteTexture(atlasTexture);
@@ -1102,8 +1185,11 @@
       let dragging = false, panning = false, lastX = 0, lastY = 0;
       canvas.addEventListener('contextmenu', (e) => e.preventDefault());
       canvas.addEventListener('pointerdown', (ev) => {
-        dragging = ev.button === 0;
-        panning = ev.button === 2;
+        // Left button orbits, unless Ctrl/Meta is held — then it pans, like the
+        // right button. (Right button always pans.)
+        const wantPan = ev.button === 2 || (ev.button === 0 && (ev.ctrlKey || ev.metaKey));
+        panning = wantPan;
+        dragging = ev.button === 0 && !wantPan;
         lastX = ev.clientX; lastY = ev.clientY;
         canvas.setPointerCapture(ev.pointerId);
       });
@@ -1115,11 +1201,13 @@
           cam.yaw -= dx * 0.005;
           cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy * 0.005));
         } else {
-          // Pan across the ground plane, scaled by distance.
+          // Pan across the ground plane, scaled by distance. dx moves along the
+          // camera's right axis, dy along its forward axis; both signs chosen so
+          // the world follows the cursor (drag down → view moves down).
           const s = cam.dist * 0.0015;
           const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
-          cam.target[0] -= (dx * cy - dy * sy) * s;
-          cam.target[2] += (dx * sy + dy * cy) * s;
+          cam.target[0] -= (dx * cy + dy * sy) * s;
+          cam.target[2] += (dx * sy - dy * cy) * s;
         }
       });
       canvas.addEventListener('pointerup', () => { dragging = panning = false; });
